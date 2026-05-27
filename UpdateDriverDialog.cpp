@@ -1,5 +1,6 @@
 #include "UpdateDriverDialog.h"
 
+#include <QDir>
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QFrame>
@@ -14,10 +15,8 @@
 #include <QIcon>
 
 UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
-                                       const QString &moduleName,
                                        QWidget *parent)
     : QDialog(parent) {
-    Q_UNUSED(moduleName);
     setWindowTitle("Update Driver Software - " + deviceName);
     setWindowFlags(Qt::Dialog | Qt::CustomizeWindowHint | Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
     setFixedSize(500, 280);
@@ -107,19 +106,59 @@ UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
         if (path.isEmpty())
             return;
 
-        QProcess proc;
-        proc.start("pkexec", {"dkms", "install", path});
-        proc.waitForFinished(60000);
+        QFileInfo pathInfo(path);
+        if (pathInfo.isSymLink()) {
+            QMessageBox::warning(this, "No driver found",
+                "The selected path is a symbolic link. "
+                "Please select a real directory.");
+            return;
+        }
 
-        if (proc.exitCode() == 0) {
+        // Resolve to canonical path once so all subsequent checks and the
+        // privileged process all operate on the same concrete location,
+        // eliminating symlink-swap races between check and use.
+        QString canonPath = QDir(path).canonicalPath();
+        if (canonPath.isEmpty()) {
+            QMessageBox::warning(this, "No driver found",
+                "Could not resolve the selected directory.");
+            return;
+        }
+
+        if (!QFileInfo::exists(canonPath + "/dkms.conf")) {
+            QMessageBox::warning(this, "No driver found",
+                "The selected directory does not contain a dkms.conf file.\n\n"
+                "Please select the root directory of the driver source.");
+            return;
+        }
+
+        if (QMessageBox::warning(this, "Install kernel module",
+                "This will install a kernel module from:\n\n" + canonPath.toHtmlEscaped() +
+                "\n\nOnly install drivers from sources you trust. Continue?",
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
+
+        // Re-verify with the resolved path immediately before handing it to
+        // a privileged process — closes the remaining TOCTOU window.
+        if (!QFileInfo::exists(canonPath + "/dkms.conf")) {
+            QMessageBox::warning(this, "No driver found",
+                "The selected directory no longer contains a dkms.conf file.");
+            return;
+        }
+
+        QProcess proc;
+        proc.start("pkexec", {"dkms", "install", canonPath});
+        bool finished = proc.waitForFinished(60000);
+
+        if (finished && proc.exitCode() == 0) {
             QMessageBox::information(this, "Driver installed",
                 "The driver was installed. "
                 "You may need to restart for changes to take effect.");
         } else {
-            QString err = QString::fromUtf8(
-                proc.readAllStandardError()).trimmed();
+            QString err = !finished
+                ? "Installation timed out."
+                : QString::fromUtf8(proc.readAllStandardError()).trimmed();
             QMessageBox::warning(this, "Installation failed",
-                "Could not install the driver:\n\n" + err);
+                "Could not install the driver:\n\n" + err.toHtmlEscaped());
         }
         accept();
     });

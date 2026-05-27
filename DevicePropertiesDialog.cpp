@@ -4,10 +4,10 @@
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
 
+#include <QShowEvent>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QFormLayout>
 #include <QGridLayout>
 #include <QLabel>
 #include <QPushButton>
@@ -25,6 +25,7 @@
 #include <QTextEdit>
 #include <QMessageBox>
 #include <QFile>
+#include <QRegularExpression>
 #include <QTextStream>
 
 DevicePropertiesDialog::DevicePropertiesDialog(const DeviceInfo &info,
@@ -32,7 +33,8 @@ DevicePropertiesDialog::DevicePropertiesDialog(const DeviceInfo &info,
     : QDialog(parent), m_info(info) {
     setWindowTitle(info.name + " Properties");
     setWindowFlags(Qt::Dialog | Qt::CustomizeWindowHint | Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
-    setFixedSize(420, 450);
+    setFixedWidth(420);
+    resize(420, 450);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
@@ -51,8 +53,25 @@ DevicePropertiesDialog::DevicePropertiesDialog(const DeviceInfo &info,
     layout->addWidget(buttons);
 }
 
+void DevicePropertiesDialog::showEvent(QShowEvent *e)
+{
+    QDialog::showEvent(e);
+    if (!m_sizeAdjusted) {
+        m_sizeAdjusted = true;
+        adjustSize();
+        setFixedSize(size());
+    }
+}
+
 bool DevicePropertiesDialog::isKernelModule() const {
     return m_info.driver.isEmpty() || m_info.driver == "(kernel)";
+}
+
+static QLabel *plainLabel(const QString &text) {
+    auto *l = new QLabel;
+    l->setTextFormat(Qt::PlainText);
+    l->setText(text);
+    return l;
 }
 
 static QWidget *deviceHeader(const QString &name, const QString &iconName) {
@@ -64,7 +83,7 @@ static QWidget *deviceHeader(const QString &name, const QString &iconName) {
         iconName.isEmpty() ? "preferences-system" : iconName).pixmap(32, 32));
     icon->setFixedSize(40, 40);
     icon->setAlignment(Qt::AlignTop);
-    auto *label = new QLabel(name);
+    auto *label = plainLabel(name);
     label->setAlignment(Qt::AlignVCenter);
     label->setWordWrap(true);
     hl->addWidget(icon);
@@ -79,9 +98,6 @@ static QFrame *hline() {
     return line;
 }
 
-// Returns a QLabel sized to the widest key used across all property tabs,
-// so the value column stays at the same x-position regardless of which tab
-// is active.
 static QLabel *formKey(const QString &text, int minWidth) {
     auto *lbl = new QLabel(text);
     lbl->setMinimumWidth(minWidth);
@@ -105,23 +121,38 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
 
     const int lw = propertyLabelWidth(w);
 
-    auto *form = new QFormLayout;
+    auto *form = new QGridLayout;
     form->setContentsMargins(48, 0, 0, 0);
-    form->setLabelAlignment(Qt::AlignLeft);
     form->setHorizontalSpacing(16);
     form->setVerticalSpacing(6);
-    form->addRow(formKey("Device type:", lw), new QLabel(
+    form->setColumnMinimumWidth(0, lw);
+    form->setColumnStretch(1, 1);
+    int fRow = 0;
+    auto makeWrappingKey = [&](const QString &text) {
+        auto *k = formKey(text, lw);
+        k->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        return k;
+    };
+    auto makeWrappingValue = [](const QString &text) {
+        auto *l = plainLabel(text);
+        l->setWordWrap(true);
+        return l;
+    };
+    auto addRow = [&](QLabel *key, QLabel *val) {
+        form->addWidget(key, fRow, 0, Qt::AlignTop | Qt::AlignLeft);
+        form->addWidget(val, fRow, 1);
+        ++fRow;
+    };
+
+    addRow(makeWrappingKey("Device type:"), makeWrappingValue(
         m_info.deviceType.isEmpty() ? "Hardware device" : m_info.deviceType));
-    form->addRow(formKey("Manufacturer:", lw), new QLabel(m_info.manufacturer));
-    auto *locationLabel = new QLabel(
+    addRow(makeWrappingKey("Manufacturer:"), makeWrappingValue(m_info.manufacturer));
+    auto *locationLabel = makeWrappingValue(
         m_info.location.isEmpty() ? "Unknown" : m_info.location);
-    locationLabel->setWordWrap(true);
     if (!m_info.rawLocation.isEmpty()
             && m_info.rawLocation != m_info.location)
         locationLabel->setToolTip(m_info.rawLocation);
-    auto *locationKey = formKey("Location:", lw);
-    locationKey->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    form->addRow(locationKey, locationLabel);
+    addRow(makeWrappingKey("Location:"), locationLabel);
     v->addLayout(form);
 
     v->addSpacing(18);
@@ -177,19 +208,44 @@ QWidget *DevicePropertiesDialog::buildDriverTab() {
 
     const int lw = propertyLabelWidth(w);
 
-    auto *form = new QFormLayout;
+    auto *form = new QGridLayout;
     form->setContentsMargins(48, 0, 0, 0);
-    form->setLabelAlignment(Qt::AlignLeft);
     form->setHorizontalSpacing(16);
     form->setVerticalSpacing(6);
-    QString providerName = m_info.manufacturer.startsWith("(Standard")
-                          ? QStringLiteral("Linux") : m_info.manufacturer;
-    form->addRow(formKey("Driver Provider:", lw), new QLabel(providerName));
-    form->addRow(formKey("Driver Date:", lw), new QLabel(
+    form->setColumnMinimumWidth(0, lw);
+    form->setColumnStretch(1, 1);
+    int fRow = 0;
+    auto makeWrappingKey = [&](const QString &text) {
+        auto *k = formKey(text, lw);
+        k->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        return k;
+    };
+    auto makeWrappingValue = [](const QString &text) {
+        auto *l = plainLabel(text);
+        l->setWordWrap(true);
+        return l;
+    };
+    auto addFormRow = [&](QLabel *key, QLabel *val) {
+        form->addWidget(key, fRow, 0, Qt::AlignTop | Qt::AlignLeft);
+        form->addWidget(val, fRow, 1);
+        ++fRow;
+    };
+
+    auto stripAuthorAnnotations = [](QString s) {
+        static const QRegularExpression kAnnotation(R"(\s*[<({\[].*?[>)}\]])", QRegularExpression::DotMatchesEverythingOption);
+        s.remove(kAnnotation);
+        return s.trimmed();
+    };
+    QString providerName = !m_info.driverAuthor.isEmpty()
+                          ? stripAuthorAnnotations(m_info.driverAuthor)
+                          : m_info.manufacturer.startsWith("(Standard")
+                            ? QStringLiteral("Linux") : m_info.manufacturer;
+    addFormRow(makeWrappingKey("Driver Provider:"), makeWrappingValue(providerName));
+    addFormRow(makeWrappingKey("Driver Date:"), makeWrappingValue(
         m_info.driverDate.isEmpty() ? "Unknown" : m_info.driverDate));
-    form->addRow(formKey("Driver Version:", lw), new QLabel(
+    addFormRow(makeWrappingKey("Driver Version:"), makeWrappingValue(
         m_info.driverVersion.isEmpty() ? m_info.driver : m_info.driverVersion));
-    form->addRow(formKey("Digital Signer:", lw), new QLabel("Linux Kernel"));
+    addFormRow(makeWrappingKey("Digital Signer:"), makeWrappingValue("Linux Hardware Compatibility Publisher"));
     v->addLayout(form);
 
     v->addSpacing(16);
@@ -262,16 +318,17 @@ QWidget *DevicePropertiesDialog::buildDriverTab() {
     });
 
     connect(updateBtn, &QPushButton::clicked, this, [this] {
-        UpdateDriverDialog dlg(m_info.name, m_info.driver, this);
+        UpdateDriverDialog dlg(m_info.name, this);
         dlg.exec();
     });
 
     connect(m_disableBtn, &QPushButton::clicked, this, [this] {
         bool disabling = !m_info.disabled;
+        const QString safeName = m_info.name.toHtmlEscaped();
         QString msg = disabling
             ? QString("This will disable %1. The device will not function "
-                      "until it is re-enabled.\n\nContinue?").arg(m_info.name)
-            : QString("This will enable %1.\n\nContinue?").arg(m_info.name);
+                      "until it is re-enabled.\n\nContinue?").arg(safeName)
+            : QString("This will enable %1.\n\nContinue?").arg(safeName);
 
         if (QMessageBox::question(this,
                 QString("%1 device").arg(disabling ? "Disable" : "Enable"),
@@ -293,7 +350,7 @@ QWidget *DevicePropertiesDialog::buildDriverTab() {
     connect(uninstallBtn, &QPushButton::clicked, this, [this] {
         if (QMessageBox::question(this, "Uninstall driver",
                 QString("This will remove the driver for %1 using DKMS.\n\n"
-                        "Are you sure?").arg(m_info.name))
+                        "Are you sure?").arg(m_info.name.toHtmlEscaped()))
             != QMessageBox::Yes)
             return;
 
@@ -413,7 +470,7 @@ QWidget *DevicePropertiesDialog::buildResourcesTab() {
     if (!m_info.sysfsPciPath.isEmpty()) {
         QFile irqFile(m_info.sysfsPciPath + "/irq");
         if (irqFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QString irq = QString::fromUtf8(irqFile.readAll()).trimmed();
+            QString irq = QString::fromUtf8(irqFile.read(1024)).trimmed();
             if (!irq.isEmpty() && irq != "0") {
                 auto *item = new QTreeWidgetItem(tree);
                 item->setIcon(0, irqIcon);

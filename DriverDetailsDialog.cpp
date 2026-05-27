@@ -1,4 +1,5 @@
 #include "DriverDetailsDialog.h"
+#include "DeviceUtils.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -32,17 +33,21 @@ DriverDetailsDialog::DriverDetailsDialog(const QString &moduleName,
     };
 
     if (!moduleName.isEmpty() && moduleName != "(kernel)") {
-        QProcess proc;
-        proc.start("modinfo", {moduleName});
-        proc.waitForFinished(3000);
-        QString output = QString::fromUtf8(proc.readAllStandardOutput());
-        for (const QString &line : output.split('\n')) {
-            int colon = line.indexOf(':');
-            if (colon < 0) continue;
-            QString field = line.left(colon).trimmed();
-            QString value = line.mid(colon + 1).trimmed();
-            if (!field.isEmpty())
-                addRow(field, value);
+        if (!isValidModuleName(moduleName)) {
+            addRow("module", "(invalid module name)");
+        } else {
+            QProcess proc;
+            proc.start("modinfo", {"--", moduleName});
+            proc.waitForFinished(3000);
+            QString output = QString::fromUtf8(proc.readAllStandardOutput());
+            for (const QString &line : output.split('\n')) {
+                int colon = line.indexOf(':');
+                if (colon < 0) continue;
+                QString field = line.left(colon).trimmed();
+                QString value = line.mid(colon + 1).trimmed();
+                if (!field.isEmpty())
+                    addRow(field, value);
+            }
         }
     } else {
         addRow("module", "(built into kernel)");

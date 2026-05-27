@@ -53,6 +53,16 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     startScan();
 }
 
+MainWindow::~MainWindow() {
+    if (m_scanner && m_scanner->isRunning()) {
+        // Disconnect first so the finished signal doesn't trigger deleteLater
+        // or null out m_scanner while we're waiting — parent-child cleanup
+        // handles deletion after wait() returns.
+        m_scanner->disconnect();
+        m_scanner->wait();
+    }
+}
+
 void MainWindow::startScan() {
     if (m_scanner && m_scanner->isRunning())
         return;
@@ -66,34 +76,36 @@ void MainWindow::startScan() {
 
 QSet<QString> MainWindow::saveExpandedState() const {
     QSet<QString> expanded;
-    std::function<void(const QModelIndex &)> walk =
-        [&](const QModelIndex &parent) {
+    std::function<void(const QModelIndex &, int)> walk =
+        [&](const QModelIndex &parent, int depth) {
         for (int i = 0; i < m_model->rowCount(parent); ++i) {
             QModelIndex idx = m_model->index(i, 0, parent);
             if (m_tree->isExpanded(idx)) {
                 expanded.insert(
-                    m_model->data(idx, Qt::DisplayRole).toString());
-                walk(idx);
+                    QString::number(depth) + ':'
+                    + m_model->data(idx, Qt::DisplayRole).toString());
+                walk(idx, depth + 1);
             }
         }
     };
-    walk(m_tree->rootIndex());
+    walk(m_tree->rootIndex(), 0);
     return expanded;
 }
 
 void MainWindow::restoreExpandedState(const QSet<QString> &expanded) {
-    std::function<void(const QModelIndex &)> walk =
-        [&](const QModelIndex &parent) {
+    std::function<void(const QModelIndex &, int)> walk =
+        [&](const QModelIndex &parent, int depth) {
         for (int i = 0; i < m_model->rowCount(parent); ++i) {
             QModelIndex idx = m_model->index(i, 0, parent);
             if (expanded.contains(
-                    m_model->data(idx, Qt::DisplayRole).toString())) {
+                    QString::number(depth) + ':'
+                    + m_model->data(idx, Qt::DisplayRole).toString())) {
                 m_tree->expand(idx);
-                walk(idx);
+                walk(idx, depth + 1);
             }
         }
     };
-    walk(m_tree->rootIndex());
+    walk(m_tree->rootIndex(), 0);
 }
 
 void MainWindow::onScanComplete(const QString &hostName,
@@ -150,7 +162,7 @@ void MainWindow::disableCurrentDevice() {
 
     if (QMessageBox::question(this,
             QString("%1 device").arg(disabled ? "Enable" : "Disable"),
-            QString("This will %1 %2.\n\nContinue?").arg(action, name))
+            QString("This will %1 %2.\n\nContinue?").arg(action, name.toHtmlEscaped()))
         != QMessageBox::Yes)
         return;
 
@@ -171,7 +183,7 @@ void MainWindow::uninstallCurrentDevice() {
 
     if (QMessageBox::question(this, "Uninstall device",
             QString("This will remove the driver for %1.\n\nAre you sure?")
-                .arg(name))
+                .arg(name.toHtmlEscaped()))
         != QMessageBox::Yes)
         return;
 
@@ -189,8 +201,7 @@ void MainWindow::buildMenus() {
             auto idx = m_tree->currentIndex();
             if (!idx.isValid()) return;
             QString name = m_model->deviceField(idx, "name").toString();
-            QString driver = m_model->deviceField(idx, "driver").toString();
-            UpdateDriverDialog dlg(name, driver, this);
+            UpdateDriverDialog dlg(name, this);
             dlg.exec();
         });
     m_actDisable = actionMenu->addAction("Disable Device",
@@ -228,7 +239,7 @@ void MainWindow::buildMenus() {
         auto *nameLabel = new QLabel("Device Manager");
 
         auto *companyLabel = new QLabel("@actuallyaridan");
-        auto *versionLabel = new QLabel("Version: 1.0 beta 8");
+        auto *versionLabel = new QLabel("Version: 1.0");
 
         auto *infoLayout = new QVBoxLayout;
         infoLayout->addWidget(nameLabel);
@@ -254,7 +265,7 @@ void MainWindow::buildMenus() {
         descLabel->setContentsMargins(4, 4, 4, 4);
 
         auto *creditsLabel = new QLabel(
-            "Repliacted in Linux using Qt and KDE. Best enjoyed with AeroThemePlasma. Any Microsoft branding is used souly for referential use only, and does not aim to usurp copyrights from Microsoft.");
+            "Replicated in Linux using Qt and KDE. Best enjoyed with AeroThemePlasma. Any Microsoft branding is used solely for referential use only, and does not aim to usurp copyrights from Microsoft.");
         creditsLabel->setWordWrap(true);
         creditsLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
         creditsLabel->setContentsMargins(4, 4, 4, 4);
@@ -329,8 +340,7 @@ void MainWindow::showContextMenu(const QPoint &pos) {
 
     menu.addAction("Update driver software...", [this, idx] {
         QString n = m_model->deviceField(idx, "name").toString();
-        QString d = m_model->deviceField(idx, "driver").toString();
-        UpdateDriverDialog dlg(n, d, this);
+        UpdateDriverDialog dlg(n, this);
         dlg.exec();
     });
 
@@ -376,6 +386,7 @@ void MainWindow::showProperties() {
         m_model->deviceField(idx, "driver").toString(),
         m_model->deviceField(idx, "driverVersion").toString(),
         m_model->deviceField(idx, "driverDate").toString(),
+        m_model->deviceField(idx, "driverAuthor").toString(),
         m_model->deviceField(idx, "location").toString(),
         m_model->deviceField(idx, "iconName").toString(),
         m_model->deviceField(idx, "disabled").toBool(),

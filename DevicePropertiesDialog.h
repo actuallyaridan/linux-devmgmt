@@ -12,6 +12,7 @@ struct DeviceInfo {
     QString driver;
     QString driverVersion;
     QString driverDate;
+    QString driverAuthor;
     QString location;
     QString iconName;
     bool disabled = false;
@@ -30,9 +31,13 @@ public:
 signals:
     void disableToggled(bool nowDisabled);
 
+protected:
+    void showEvent(QShowEvent *e) override;
+
 private:
     DeviceInfo m_info;
     QPushButton *m_disableBtn = nullptr;
+    bool m_sizeAdjusted = false;
 
     QWidget *buildGeneralTab();
     QWidget *buildDriverTab();

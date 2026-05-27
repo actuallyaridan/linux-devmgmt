@@ -35,14 +35,41 @@ QString runCmd(const QString &cmd, const QStringList &args,
 struct DriverInfo {
     QString version;
     QString date;
+    QString author;
     bool isDkms = false;
 };
 
-QString pacmanField(const QString &package, const QString &field) {
-    QString out = runCmd("pacman", {"-Qi", package});
-    if (out.isEmpty())
-        return {};
-    for (const QString &line : out.split('\n')) {
+struct ModinfoResult {
+    QString version;
+    QString filename;
+    QString author;
+};
+
+ModinfoResult queryModinfo(const QString &moduleName) {
+    QProcess proc;
+    proc.start("modinfo", {"--", moduleName});
+    ModinfoResult r;
+    if (!proc.waitForFinished(2000) || proc.exitCode() != 0)
+        return r;
+    for (const QString &line :
+         QString::fromUtf8(proc.readAllStandardOutput()).split('\n')) {
+        int colon = line.indexOf(':');
+        if (colon < 0)
+            continue;
+        QString key = line.left(colon).trimmed();
+        QString val = line.mid(colon + 1).trimmed();
+        if (key == "version")
+            r.version = val;
+        else if (key == "filename")
+            r.filename = val;
+        else if (key == "author")
+            r.author = val;
+    }
+    return r;
+}
+
+QString pacmanFieldFrom(const QString &output, const QString &field) {
+    for (const QString &line : output.split('\n')) {
         if (line.startsWith(field)) {
             int colon = line.indexOf(':');
             if (colon > 0)
@@ -52,16 +79,22 @@ QString pacmanField(const QString &package, const QString &field) {
     return {};
 }
 
-QString pacmanBuildDate(const QString &package) {
-    QString version = pacmanField(package, "Version");
-    if (version.isEmpty())
+QString pacmanField(const QString &package, const QString &field) {
+    return pacmanFieldFrom(runCmd("pacman", {"-Qi", package}), field);
+}
+
+QString pacmanBuildDate(const QString &package, const QString &version) {
+    static const QRegularExpression kPkgRe("^[a-zA-Z0-9_.+@-]+$");
+    if (version.isEmpty()
+            || !kPkgRe.match(package).hasMatch()
+            || !kPkgRe.match(version).hasMatch())
         return {};
     QString dirPath = QStringLiteral("/var/lib/pacman/local/%1-%2")
                           .arg(package, version);
     QFile f(dirPath + "/desc");
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
         return {};
-    QString content = QString::fromUtf8(f.readAll());
+    QString content = QString::fromUtf8(f.read(65536));
     int idx = content.indexOf("%BUILDDATE%");
     if (idx < 0)
         return {};
@@ -99,14 +132,16 @@ DriverInfo dkmsInfo(const QString &moduleName) {
     for (const QString &source : dkmsRoot.entryList(
              QDir::Dirs | QDir::NoDotAndDotDot)) {
         QDir sourceDir(dkmsRoot.absoluteFilePath(source));
-        QString version;
+        QStringList versions;
         for (const QString &entry : sourceDir.entryList(
                  QDir::Dirs | QDir::NoDotAndDotDot)) {
             if (!entry.startsWith("kernel-"))
-                version = entry;
+                versions.append(entry);
         }
-        if (version.isEmpty())
+        if (versions.isEmpty())
             continue;
+        versions.sort();
+        QString version = versions.last();
 
         QDir kernelDir(sourceDir.absoluteFilePath(version + "/" + kver));
         if (!kernelDir.exists())
@@ -147,38 +182,42 @@ DriverInfo moduleDriverInfo(const QString &moduleName) {
         return info;
     }
 
-    QString ver = runCmd("modinfo", {"-F", "version", moduleName});
-    QString koPath = runCmd("modinfo", {"-F", "filename", moduleName});
+    ModinfoResult mi = queryModinfo(moduleName);
 
-    if (koPath == "(builtin)" || koPath.isEmpty()) {
-        info.version = ver.isEmpty() ? kernelRelease() : ver;
+    if (mi.filename == "(builtin)" || mi.filename.isEmpty()) {
+        info.version = mi.version.isEmpty() ? kernelRelease() : mi.version;
+        info.author = mi.author;
         return info;
     }
 
-    if (koPath.contains("/dkms/")) {
+    if (mi.filename.contains("/dkms/")) {
         DriverInfo dkms = dkmsInfo(moduleName);
         if (!dkms.version.isEmpty()) {
-            info.version = ver.isEmpty() ? dkms.version : ver;
+            info.version = mi.version.isEmpty() ? dkms.version : mi.version;
             info.date = dkms.date;
+            info.author = mi.author;
             info.isDkms = true;
             return info;
         }
     }
 
-    QString pkg = runCmd("pacman", {"-Qoq", koPath});
+    QString pkg = runCmd("pacman", {"-Qoq", mi.filename});
     if (!pkg.isEmpty()) {
-        QString pkgVer = pacmanField(pkg, "Version");
-        QString pkgDate = pacmanBuildDate(pkg);
-        info.version = ver.isEmpty()
+        QString pacmanOut = runCmd("pacman", {"-Qi", pkg});
+        QString pkgVer = pacmanFieldFrom(pacmanOut, "Version");
+        QString pkgDate = pacmanBuildDate(pkg, pkgVer);
+        info.version = mi.version.isEmpty()
             ? (pkgVer.isEmpty() ? kernelRelease() : pkgVer)
-            : ver;
+            : mi.version;
         QString known = knownVersionDate(info.version);
         info.date = known.isEmpty() ? pkgDate : known;
+        info.author = mi.author;
         return info;
     }
 
-    info.version = ver.isEmpty() ? kernelRelease() : ver;
-    QFileInfo fi(koPath);
+    info.version = mi.version.isEmpty() ? kernelRelease() : mi.version;
+    info.author = mi.author;
+    QFileInfo fi(mi.filename);
     if (fi.exists())
         info.date = formatDate(fi.lastModified());
     return info;
@@ -280,7 +319,8 @@ QString driverNameFor(const QString &sysfsPath) {
 }
 
 QString dmiProductName() {
-    return readSysFile("/sys/class/dmi/id/product_name").trimmed();
+    static const QString name = readSysFile("/sys/class/dmi/id/product_name").trimmed();
+    return name;
 }
 
 QString friendlyLocation(const QString &sysfsPath,
@@ -302,17 +342,19 @@ QString friendlyLocation(const QString &sysfsPath,
         if (match.hasMatch())
             return QString("plugged in to USB port %1")
                 .arg(match.captured(1));
-        return "pluged in to USB port";
+        return "plugged in to USB port";
     }
 
     QRegularExpression pciRe(
         R"((\d+):([0-9a-f]+):([0-9a-f]+)\.([0-9a-f]+))");
     auto match = pciRe.match(path);
     if (match.hasMatch()) {
-        bool ok;
-        int bus = match.captured(2).toInt(&ok, 16);
-        int dev = match.captured(3).toInt(&ok, 16);
-        int fn  = match.captured(4).toInt(&ok, 16);
+        bool ok1, ok2, ok3;
+        int bus = match.captured(2).toInt(&ok1, 16);
+        int dev = match.captured(3).toInt(&ok2, 16);
+        int fn  = match.captured(4).toInt(&ok3, 16);
+        if (!ok1 || !ok2 || !ok3)
+            return {};
         return QString("PCI bus %1, device %2, function %3")
             .arg(bus).arg(dev).arg(fn);
     }
@@ -386,6 +428,7 @@ Device makePciDevice(const QString &sysfsPath) {
     DriverInfo di = moduleDriverInfo(d.driver);
     d.driverVersion = di.version;
     d.driverDate = di.date;
+    d.driverAuthor = di.author;
     d.isDkms = di.isDkms;
     d.location = friendlyLocation(sysfsPath, {});
     d.rawLocation = QFileInfo(sysfsPath).fileName();
@@ -396,11 +439,12 @@ Device makePciDevice(const QString &sysfsPath) {
 QVector<Device> scanPciByClass(const QString &classPrefix) {
     QVector<Device> out;
     QDir base("/sys/bus/pci/devices");
+    const QString lowerPrefix = classPrefix.toLower();
     for (const QString &entry : base.entryList(
              QDir::Dirs | QDir::NoDotAndDotDot)) {
         QString path = base.absoluteFilePath(entry);
         QString cls = readHexId(path + "/class");
-        if (cls.startsWith(classPrefix.toLower())) {
+        if (cls.startsWith(lowerPrefix)) {
             Device d = makePciDevice(path);
             d.rawLocation = entry;
             out.append(d);
@@ -418,7 +462,7 @@ QVector<Device> scanCpus() {
     QString modelName;
     QString vendorId;
 
-    QString content = QString::fromUtf8(f.readAll());
+    QString content = QString::fromUtf8(f.read(524288));
     for (const QString &line : content.split('\n')) {
         if (line.startsWith("model name"))
             modelName = line.section(':', 1).trimmed();
@@ -457,7 +501,6 @@ QVector<Device> scanDisks() {
         QString vendor;
 
         if (entry.startsWith("nvme")) {
-            // NVMe: model lives at device/model directly.
             model = readSysFile(path + "/device/model");
             // For NVMe, vendor comes from the PCI subsystem.
             QString sysPath = QFileInfo(path + "/device").canonicalFilePath();
@@ -481,6 +524,7 @@ QVector<Device> scanDisks() {
         d.driver = QFileInfo(driverLink).fileName();
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -525,6 +569,7 @@ QVector<Device> scanUsbDevices() {
             QFileInfo(path + "/driver").symLinkTarget()).fileName();
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -557,18 +602,21 @@ QVector<Device> scanNetwork() {
 
 QString decodePnpId(quint8 b1, quint8 b2) {
     int v = (b1 << 8) | b2;
+    auto field = [](int bits) -> QChar {
+        int n = bits & 0x1f;
+        if (n < 1 || n > 26) return QChar('?');
+        return QChar('A' + n - 1);
+    };
     QString s;
-    s.append(QChar('A' + ((v >> 10) & 0x1f) - 1));
-    s.append(QChar('A' + ((v >> 5) & 0x1f) - 1));
-    s.append(QChar('A' + (v & 0x1f) - 1));
+    s.append(field(v >> 10));
+    s.append(field(v >> 5));
+    s.append(field(v));
     return s;
 }
 
-QString pnpVendorName(const QString &pnpId) {
-    static QHash<QString, QString> cache;
-    static bool loaded = false;
-    if (!loaded) {
-        loaded = true;
+const QHash<QString, QString> &pnpIds() {
+    static const QHash<QString, QString> db = [] {
+        QHash<QString, QString> h;
         QFile f("/usr/share/hwdata/pnp.ids");
         if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
             QTextStream in(&f);
@@ -578,13 +626,16 @@ QString pnpVendorName(const QString &pnpId) {
                     continue;
                 if (line.length() < 4)
                     continue;
-                QString id = line.left(3).toUpper();
-                QString name = line.mid(4).trimmed();
-                cache.insert(id, name);
+                h.insert(line.left(3).toUpper(), line.mid(4).trimmed());
             }
         }
-    }
-    return cache.value(pnpId.toUpper(), pnpId);
+        return h;
+    }();
+    return db;
+}
+
+QString pnpVendorName(const QString &pnpId) {
+    return pnpIds().value(pnpId.toUpper(), pnpId);
 }
 
 QString parseEdid(const QByteArray &edid, QString *vendorOut) {
@@ -619,7 +670,7 @@ QVector<Device> scanMonitors() {
         QFile f(edidPath);
         if (!f.open(QIODevice::ReadOnly))
             continue;
-        QByteArray edid = f.readAll();
+        QByteArray edid = f.read(32768);
         if (edid.isEmpty())
             continue;
         QString vendor;
@@ -633,6 +684,7 @@ QVector<Device> scanMonitors() {
         d.driver = "drm";
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
         QString gpuName;
@@ -701,6 +753,16 @@ QVector<Device> scanMice() {
     return out;
 }
 
+int popcountll(quint64 v) {
+#ifdef __GNUC__
+    return __builtin_popcountll(v);
+#else
+    int n = 0;
+    while (v) { ++n; v &= v - 1; }
+    return n;
+#endif
+}
+
 QVector<Device> scanKeyboards() {
     QVector<Device> out;
     QDir base("/sys/class/input");
@@ -733,7 +795,7 @@ QVector<Device> scanKeyboards() {
             bool ok;
             quint64 v = word.toULongLong(&ok, 16);
             if (ok)
-                totalBits += __builtin_popcountll(v);
+                totalBits += popcountll(v);
         }
         if (totalBits < 20)
             continue;
@@ -786,6 +848,7 @@ QVector<Device> scanHidGeneric() {
             QFileInfo(path + "/driver").symLinkTarget()).fileName();
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -809,11 +872,11 @@ QVector<Device> scanBluetooth() {
         QString path = QFileInfo(
             base.absoluteFilePath(entry)).canonicalFilePath();
 
-        // Walk up the sysfs tree to find the USB device with a product string.
         QString name;
         QString mfr;
         QDir deviceDir(path);
-        while (deviceDir.cdUp()) {
+        int depth = 0;
+        while (deviceDir.cdUp() && ++depth <= 20) {
             QString product = readSysFile(
                 deviceDir.absolutePath() + "/product");
             QString manufacturer = readSysFile(
@@ -838,6 +901,7 @@ QVector<Device> scanBluetooth() {
         d.manufacturer = mfr.isEmpty() ? "(Standard Bluetooth device)" : mfr;
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -867,6 +931,7 @@ QVector<Device> scanTpm() {
         d.driver = "tpm";
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
         d.location = friendlyLocation(
@@ -897,6 +962,7 @@ QVector<Device> scanOpticalDrives() {
         d.driver = QFileInfo(drv).fileName();
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -923,11 +989,11 @@ QVector<Device> scanHidBatteries() {
         if (!path.contains("hid", Qt::CaseInsensitive))
             continue;
 
-        // Walk up the sysfs tree to find the device name.
         QString name;
         QString mfr;
         QDir dir(path);
-        while (dir.cdUp()) {
+        int depth = 0;
+        while (dir.cdUp() && ++depth <= 20) {
             QString uevent = readSysFile(dir.absolutePath() + "/uevent");
             for (const QString &line : uevent.split('\n')) {
                 if (line.startsWith("HID_NAME=")) {
@@ -1028,6 +1094,7 @@ QVector<Device> scanSoundCards() {
         d.driver = driver.isEmpty() ? "snd" : driver;
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
@@ -1062,11 +1129,12 @@ QVector<Device> scanBatteries() {
         d.driver = "battery";
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
         d.location = hostModel.isEmpty()
             ? friendlyLocation(QFileInfo(path).canonicalFilePath(), entry)
-            : "On " + hostModel;
+            : "on " + hostModel;
         out.append(d);
     }
     return out;
@@ -1090,6 +1158,7 @@ QVector<Device> scanRtc() {
         d.driver = drvToken.isEmpty() ? "rtc_cmos" : drvToken;
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
         d.location = []{
@@ -1130,6 +1199,7 @@ QVector<Device> scanPlatformDevices() {
         d.driver = drv;
         DriverInfo di = moduleDriverInfo(drv);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
         d.location = []{
@@ -1199,16 +1269,20 @@ QVector<Device> scanBlacklistedMissing(
         QString mod = line.mid(10).trimmed();
         if (mod.isEmpty() || foundDrivers.contains(mod))
             continue;
+        static const QRegularExpression kModRe("^[a-zA-Z0-9_-]+$");
+        if (!kModRe.match(mod).hasMatch())
+            continue;
 
         Device d;
         d.driver = mod;
         d.disabled = true;
 
-        QString desc = runCmd("modinfo", {"-F", "description", mod});
+        QString desc = runCmd("modinfo", {"-F", "description", "--", mod});
         d.name = desc.isEmpty() ? mod : desc;
 
         DriverInfo di = moduleDriverInfo(mod);
         d.driverVersion = di.version;
+        d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.status = "Working properly";
         d.manufacturer = "(Standard)";
@@ -1232,7 +1306,7 @@ QVector<DeviceCategory> scanDevices() {
     auto batteries = scanBatteries();
     batteries += scanHidBatteries();
     addIfAny("Batteries", "kded5", batteries);
-    addIfAny("Bluetooth", "bluetooth-symbolic", scanBluetooth());
+    addIfAny("Bluetooth Radios", "bluetooth-symbolic", scanBluetooth());
     addIfAny("Disk drives", "drive-harddisk", scanDisks());
     addIfAny("Display adapters", "video-display", scanPciByClass("03"));
     addIfAny("DVD/CD-ROM drives", "media-optical", scanOpticalDrives());

@@ -109,34 +109,20 @@ void DeviceModel::setCategories(const QString &hostName,
             host->children.removeLast();
             delete catNode;
         }
-
-        if (cat.name == "Batteries") {
-            auto *computerCat = new Node{CategoryNode, "Computer", "computer",
-                                         host, {}, nullptr};
-            host->children.append(computerCat);
-            auto *machineDev = new Node{DeviceNode, m_machine.name,
-                                        "computer", computerCat,
-                                        {}, &m_machine};
-            computerCat->children.append(machineDev);
-        }
     }
 
-    bool computerInserted = false;
-    for (auto *child : host->children) {
-        if (child->label == "Computer") {
-            computerInserted = true;
-            break;
-        }
+    auto *computerCat = new Node{CategoryNode, "Computer", "computer",
+                                 host, {}, nullptr};
+    int insertPos = 0;
+    while (insertPos < host->children.size() &&
+           host->children[insertPos]->label.compare("Computer", Qt::CaseInsensitive) < 0) {
+        ++insertPos;
     }
-    if (!computerInserted) {
-        auto *computerCat = new Node{CategoryNode, "Computer", "computer",
-                                     host, {}, nullptr};
-        host->children.prepend(computerCat);
-        auto *machineDev = new Node{DeviceNode, m_machine.name,
-                                    "computer", computerCat,
-                                    {}, &m_machine};
-        computerCat->children.append(machineDev);
-    }
+    host->children.insert(insertPos, computerCat);
+    auto *machineDev = new Node{DeviceNode, m_machine.name,
+                                "computer", computerCat,
+                                {}, &m_machine};
+    computerCat->children.append(machineDev);
 
     if (!disabledDevices.isEmpty()) {
         auto *disabledCat = new Node{DisabledCategoryNode,
@@ -220,6 +206,7 @@ QVariant DeviceModel::deviceField(const QModelIndex &index,
     if (field == "driver") return d.driver;
     if (field == "driverVersion") return d.driverVersion;
     if (field == "driverDate") return d.driverDate;
+    if (field == "driverAuthor") return d.driverAuthor;
     if (field == "location") return d.location;
     if (field == "iconName") return d.iconName;
     if (field == "disabled") return d.disabled;
