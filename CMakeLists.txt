@@ -21,3 +21,5 @@ add_executable(devmgmt
     DeviceScanner.cpp
 )
 target_link_libraries(devmgmt PRIVATE Qt6::Widgets)
+
+install(TARGETS devmgmt RUNTIME DESTINATION bin)

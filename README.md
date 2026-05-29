@@ -11,7 +11,7 @@
 <br>
 
 > [!NOTE]
-> **Built for CachyOS / Arch Linux.**<br>Some features (DKMS uninstall, driver date lookup) depend on `dkms` and `pacman`. Other distros may need minor adjustments.
+> **Built for CachyOS / Arch Linux.** Also packaged as a Nix flake for NixOS.<br>Some features (DKMS uninstall, driver date lookup) depend on `dkms` and `pacman`. Other distros may need minor adjustments.
 
 | | | |
 |:-------------------------:|:-------------------------:|:-------------------------:|
@@ -21,6 +21,8 @@
 
 ## Building
 
+### Arch / CachyOS
+
 ```bash
 sudo pacman -S qt6-base cmake
 cmake -B build
@@ -28,12 +30,31 @@ cmake --build build -j
 ./build/devmgmt
 ```
 
+### Nix
+
+```bash
+nix build
+./result/bin/devmgmt
+
+# or run directly
+nix run
+```
+
+A dev shell with Qt Creator and GDB is also available:
+
+```bash
+nix develop
+```
+
 ## Runtime dependencies
+
+On Arch, you need these installed separately. The Nix flake handles all of them automatically.
 
 | Tool | Purpose |
 |------|---------|
 | `pkexec` | Privilege escalation for enable/disable/uninstall |
 | `modinfo` | Driver details |
+| `bluetoothctl` | Bluetooth device disconnect |
 | `dkms` | *(optional)* DKMS driver management |
 | `pacman` | *(optional)* Package date lookup |
 

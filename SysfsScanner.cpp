@@ -17,6 +17,22 @@
 
 namespace {
 
+// Resolve data-file directories via environment variables so that Nix (and
+// other non-FHS layouts) can point us at the right store paths.
+QString hwdataPath(const QString &filename) {
+    QByteArray dir = qgetenv("HWDATA_DIR");
+    if (!dir.isEmpty())
+        return QString::fromUtf8(dir) + "/" + filename;
+    return QStringLiteral("/usr/share/hwdata/") + filename;
+}
+
+QString libdrmPath(const QString &filename) {
+    QByteArray dir = qgetenv("LIBDRM_DIR");
+    if (!dir.isEmpty())
+        return QString::fromUtf8(dir) + "/" + filename;
+    return QStringLiteral("/usr/share/libdrm/") + filename;
+}
+
 QString kernelRelease() {
     return QSysInfo::kernelVersion();
 }
@@ -261,12 +277,12 @@ IdsDb loadIds(const QString &path) {
 }
 
 const IdsDb &pciIds() {
-    static IdsDb db = loadIds("/usr/share/hwdata/pci.ids");
+    static IdsDb db = loadIds(hwdataPath("pci.ids"));
     return db;
 }
 
 const IdsDb &usbIds() {
-    static IdsDb db = loadIds("/usr/share/hwdata/usb.ids");
+    static IdsDb db = loadIds(hwdataPath("usb.ids"));
     return db;
 }
 
@@ -274,7 +290,7 @@ const IdsDb &usbIds() {
 // Returns a hash keyed by "device:revision" (uppercase, no 0x prefix).
 QHash<QString, QString> loadAmdgpuIds() {
     QHash<QString, QString> db;
-    QFile f("/usr/share/libdrm/amdgpu.ids");
+    QFile f(libdrmPath("amdgpu.ids"));
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
         return db;
     QTextStream in(&f);
@@ -652,7 +668,7 @@ QString decodePnpId(quint8 b1, quint8 b2) {
 const QHash<QString, QString> &pnpIds() {
     static const QHash<QString, QString> db = [] {
         QHash<QString, QString> h;
-        QFile f("/usr/share/hwdata/pnp.ids");
+        QFile f(hwdataPath("pnp.ids"));
         if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
             QTextStream in(&f);
             while (!in.atEnd()) {
