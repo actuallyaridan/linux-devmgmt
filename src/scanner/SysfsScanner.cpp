@@ -881,6 +881,12 @@ QVector<Device> scanKeyboards() {
     }
     return out;
 }
+
+// known HID drivers for game controllers
+const QSet<QString> kControllerDrivers = {
+    "playstation", "sony", "nintendo", "xpad", "xpadneo",
+};
+
 QVector<Device> scanHidGeneric() {
     QVector<Device> out;
     QDir base("/sys/bus/hid/devices");
@@ -910,6 +916,9 @@ QVector<Device> scanHidGeneric() {
         d.status = "Working properly";
         d.driver = QFileInfo(
             QFileInfo(path + "/driver").symLinkTarget()).fileName();
+        // game controllers get their own category
+        if (kControllerDrivers.contains(d.driver))
+            continue;
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
         d.driverAuthor = di.author;
@@ -1043,6 +1052,25 @@ QVector<Device> scanOpticalDrives() {
     return out;
 }
 
+
+// checks whether a power_supply battery at the given canonical path is
+// parented by a game controller HID driver
+bool isControllerBattery(const QString &canonicalPath) {
+    QDir dir(canonicalPath);
+    int depth = 0;
+    while (dir.cdUp() && ++depth <= 20) {
+        QString uevent = readSysFile(dir.absolutePath() + "/uevent");
+        for (const QString &line : uevent.split('\n')) {
+            if (line.startsWith("DRIVER=")) {
+                if (kControllerDrivers.contains(line.mid(7).trimmed()))
+                    return true;
+            }
+        }
+        if (dir.absolutePath() == "/sys/devices") break;
+    }
+    return false;
+}
+
 QVector<Device> scanHidBatteries() {
     QVector<Device> out;
     QDir base("/sys/class/power_supply");
@@ -1057,6 +1085,8 @@ QVector<Device> scanHidBatteries() {
         if (type != "Battery")
             continue;
         if (!path.contains("hid", Qt::CaseInsensitive))
+            continue;
+        if (isControllerBattery(path))
             continue;
 
         QString name;
@@ -1190,6 +1220,7 @@ QVector<Device> scanBatteries() {
             continue;
         if (entry.contains("hidpp", Qt::CaseInsensitive))
             continue;
+
         QString model = readSysFile(path + "/model_name");
         QString mfr = readSysFile(path + "/manufacturer");
         Device d;
@@ -1205,6 +1236,83 @@ QVector<Device> scanBatteries() {
         d.location = hostModel.isEmpty()
             ? friendlyLocation(QFileInfo(path).canonicalFilePath(), entry)
             : "on " + hostModel;
+        out.append(d);
+    }
+    return out;
+}
+
+QVector<Device> scanGameControllers() {
+    QVector<Device> out;
+    QDir base("/sys/class/power_supply");
+    if (!base.exists())
+        return out;
+
+    for (const QString &entry : base.entryList(
+             QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        QString path = QFileInfo(
+            base.absoluteFilePath(entry)).canonicalFilePath();
+        QString type = readSysFile(path + "/type");
+        if (type != "Battery")
+            continue;
+        if (!isControllerBattery(path))
+            continue;
+
+        // walk up sysfs to find the HID device name and driver
+        QString name;
+        QString mfr;
+        QString driverName;
+        QDir dir(path);
+        int depth = 0;
+        while (dir.cdUp() && ++depth <= 20) {
+            QString dirPath = dir.absolutePath();
+            QString uevent = readSysFile(dirPath + "/uevent");
+            for (const QString &line : uevent.split('\n')) {
+                if (line.startsWith("HID_NAME=") && name.isEmpty())
+                    name = line.mid(9).trimmed();
+                else if (line.startsWith("DRIVER=") && driverName.isEmpty())
+                    driverName = line.mid(7).trimmed();
+            }
+            if (mfr.isEmpty()) {
+                QString m = readSysFile(dirPath + "/manufacturer");
+                if (!m.isEmpty())
+                    mfr = m;
+            }
+            if (!name.isEmpty()) break;
+            if (dirPath == "/sys/devices") break;
+        }
+
+        if (name.isEmpty())
+            name = readSysFile(path + "/model_name");
+        if (name.isEmpty())
+            name = entry;
+
+        // extract bluetooth address if present
+        QString btAddr;
+        static const QRegularExpression btAddrRe(
+            R"(([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})$)");
+        auto addrMatch = btAddrRe.match(entry);
+        if (addrMatch.hasMatch())
+            btAddr = addrMatch.captured(1);
+
+        QString capacity = readSysFile(path + "/capacity");
+        QString deviceStatus = "Working properly";
+        if (!capacity.isEmpty())
+            deviceStatus = QString("Battery level: %1%").arg(capacity);
+
+        Device d;
+        d.name = name;
+        d.manufacturer = mfr.isEmpty()
+            ? "(Standard game controller)" : mfr;
+        d.status = deviceStatus;
+        d.driver = driverName;
+        DriverInfo di = moduleDriverInfo(d.driver);
+        d.driverVersion = di.version;
+        d.driverAuthor = di.author;
+        d.driverDate = di.date;
+        d.isDkms = di.isDkms;
+        d.rawLocation = entry;
+        d.btAddress = btAddr;
+        d.location = friendlyLocation(path, entry);
         out.append(d);
     }
     return out;
@@ -1456,6 +1564,8 @@ QVector<DeviceCategory> scanDevices() {
     batteries += scanHidBatteries();
     addIfAny("Batteries", "kded5", batteries);
     addIfAny("Bluetooth Radios", "network-bluetooth", scanBluetooth());
+    addIfAny("Game controllers", "input-gaming",
+             scanGameControllers());
     addIfAny("Disk drives", "drive-harddisk", scanDisks());
     addIfAny("Display adapters", "video-display", scanPciByClass("03"));
     addIfAny("DVD/CD-ROM drives", "media-optical", scanOpticalDrives());
