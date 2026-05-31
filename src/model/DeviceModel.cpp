@@ -1,6 +1,7 @@
 #include "DeviceModel.h"
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
+#include "../ui/IconHelper.h"
 
 #include <QFile>
 #include <QTextStream>
@@ -38,7 +39,7 @@ void DeviceModel::setCategories(const QString &hostName,
     m_storage = categories;
     loadDisabledModules();
 
-    auto *host = new Node{ComputerNode, hostName, "computer",
+    auto *host = new Node{ComputerNode, hostName, "preferences-other",
                           m_root, {}, nullptr};
     m_root->children.append(host);
 
@@ -47,8 +48,13 @@ void DeviceModel::setCategories(const QString &hostName,
     QString biosVersion = readSysFile("/sys/class/dmi/id/bios_version");
     QString biosDate    = readSysFile("/sys/class/dmi/id/bios_date");
 
-    if (productName.isEmpty())
+    if (productName.isEmpty()) {
+#if defined(__aarch64__)
+        productName = QStringLiteral("ACPI arm64-based PC");
+#else
         productName = QStringLiteral("ACPI x64-based PC");
+#endif
+    }
     if (biosVendor.isEmpty())
         biosVendor = QStringLiteral("Unknown");
 
@@ -184,7 +190,7 @@ QVariant DeviceModel::data(const QModelIndex &index, int role) const {
     if (role == Qt::DisplayRole)
         return n->label;
     if (role == Qt::DecorationRole)
-        return QIcon::fromTheme(n->iconName);
+        return resolveIcon(n->iconName);
     return {};
 }
 

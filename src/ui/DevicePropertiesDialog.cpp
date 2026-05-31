@@ -3,7 +3,12 @@
 #include "UpdateDriverDialog.h"
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
+#include "IconHelper.h"
 
+#include <QCoreApplication>
+#include <QStandardPaths>
+#include <QTimer>
+#include <memory>
 #include <QShowEvent>
 #include <QTabWidget>
 #include <QVBoxLayout>
@@ -28,6 +33,65 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QTextStream>
+
+namespace {
+
+QProcess *s_usbmuxdProc = nullptr;
+
+bool isUsbmuxdRunning() {
+    QProcess p;
+    p.start("idevice_id", {"-l"});
+    return p.waitForFinished(500) && p.exitCode() == 0;
+}
+
+void launchUsbmuxd() {
+    if (s_usbmuxdProc) return;
+    const QString usbmuxdExe = QStandardPaths::findExecutable("usbmuxd");
+    if (usbmuxdExe.isEmpty())
+        return;
+    s_usbmuxdProc = new QProcess;
+    if (!QStandardPaths::findExecutable("pkexec").isEmpty()) {
+        s_usbmuxdProc->start("pkexec", {usbmuxdExe, "-f"});
+    } else {
+        s_usbmuxdProc->start(usbmuxdExe, {"-f"});
+    }
+    if (!s_usbmuxdProc->waitForStarted(10000)) {
+        delete s_usbmuxdProc;
+        s_usbmuxdProc = nullptr;
+        return;
+    }
+    // Clear the handle if usbmuxd exits on its own (crash, external stop, etc.)
+    // so launchUsbmuxd() can be called again if needed.
+    QObject::connect(s_usbmuxdProc,
+                     QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     [] {
+        if (s_usbmuxdProc) {
+            s_usbmuxdProc->deleteLater();
+            s_usbmuxdProc = nullptr;
+        }
+    });
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, [] {
+            if (s_usbmuxdProc) {
+                QProcess *proc = s_usbmuxdProc;
+                s_usbmuxdProc = nullptr;
+                // Disconnect first to prevent the finished lambda from running a
+                // deleteLater() on a pointer we are about to delete synchronously.
+                proc->disconnect();
+                // usbmuxd -x sends an exit request through the socket.
+                // The socket is world-writable so this works without root,
+                // unlike sending SIGTERM directly to a root-owned process.
+                QProcess::execute("usbmuxd", {"-x"});
+                proc->waitForFinished(3000);
+                delete proc;
+            }
+        });
+    }
+}
+
+} // namespace
 
 DevicePropertiesDialog::DevicePropertiesDialog(const DeviceInfo &info,
                                                QWidget *parent)
@@ -80,8 +144,8 @@ static QWidget *deviceHeader(const QString &name, const QString &iconName) {
     auto *hl = new QHBoxLayout(row);
     hl->setContentsMargins(0, 0, 0, 8);
     auto *icon = new QLabel;
-    icon->setPixmap(QIcon::fromTheme(
-        iconName.isEmpty() ? "preferences-system" : iconName).pixmap(32, 32));
+    icon->setPixmap(resolveIcon(iconName.isEmpty()
+        ? QStringLiteral("preferences-system") : iconName).pixmap(32, 32));
     icon->setFixedSize(40, 40);
     icon->setAlignment(Qt::AlignTop);
     auto *label = plainLabel(name);
@@ -168,6 +232,8 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
     else if (m_info.status == "No driver loaded")
         statusText = "The drivers for this device are not installed. "
                      "(Code 28)";
+    else if (m_info.status == "No battery level")
+        statusText = "This device is working properly.\n\nNo reported battery level.";
     else if (m_info.status.startsWith("Battery level: "))
         statusText = "This device is working properly.\n\nCurrent battery level: "
                      + m_info.status.mid(15);
@@ -176,7 +242,6 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
 
     auto *statusGroup = new QGroupBox("Device status");
     auto *gbLayout = new QVBoxLayout(statusGroup);
-    gbLayout->setContentsMargins(8, 3, 8, 32);
 
     auto *textFrame = new QFrame;
     textFrame->setStyleSheet(
@@ -198,6 +263,107 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
     gbLayout->addWidget(textFrame);
 
     v->addWidget(statusGroup);
+
+    if (m_info.driver == "apple-mfi-fastcharge") {
+        const bool usbmuxdOk = isUsbmuxdRunning();
+
+        if (!usbmuxdOk) {
+            gbLayout->setContentsMargins(8, 3, 8, 8);
+
+            auto *usbmuxdSection = new QWidget;
+            auto *sectionLayout = new QVBoxLayout(usbmuxdSection);
+            sectionLayout->setContentsMargins(0, 4, 0, 0);
+            sectionLayout->setSpacing(6);
+
+            auto *infoLabel = new QLabel(
+                "This device requires usbmuxd to be running to read its battery level. "
+                "After starting, reopen this window to see the battery level.");
+            infoLabel->setWordWrap(true);
+            sectionLayout->addWidget(infoLabel);
+
+            auto *startBtn = new QPushButton("Request battery level");
+            sectionLayout->addWidget(startBtn, 0, Qt::AlignLeft);
+
+            gbLayout->addWidget(usbmuxdSection);
+
+            connect(startBtn, &QPushButton::clicked, this,
+                    [this, usbmuxdSection, startBtn] {
+                startBtn->setEnabled(false);
+                startBtn->setText("Starting usbmuxd...");
+                launchUsbmuxd();
+
+                auto attempts = std::make_shared<int>(0);
+                auto inFlight = std::make_shared<bool>(false);
+                auto *pollTimer = new QTimer(this);
+                connect(pollTimer, &QTimer::timeout, this,
+                        [this, usbmuxdSection, startBtn, pollTimer, attempts, inFlight] {
+                    if (*inFlight) return;
+                    *inFlight = true;
+                    auto *checker = new QProcess(this);
+                    connect(checker,
+                            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                            this,
+                            [this, usbmuxdSection, startBtn, pollTimer,
+                             attempts, checker, inFlight]
+                            (int exitCode, QProcess::ExitStatus) {
+                        *inFlight = false;
+                        checker->deleteLater();
+                        if (exitCode == 0) {
+                            pollTimer->stop();
+                            pollTimer->deleteLater();
+                            usbmuxdSection->hide();
+                            adjustSize();
+                            emit usbmuxdStarted();
+                            accept();
+                        } else if (++(*attempts) >= 30) {
+                            pollTimer->stop();
+                            pollTimer->deleteLater();
+                            startBtn->setEnabled(true);
+                            startBtn->setText("Request battery level");
+                            QMessageBox::warning(this, "Could not start usbmuxd",
+                                "usbmuxd did not start within the expected time.\n\n"
+                                "Try launching it from your terminal:\n    sudo usbmuxd\n\n"
+                                "If usbmuxd is not installed, install it with your "
+                                "package manager. It also lets you browse and manage "
+                                "your device's storage.");
+                        }
+                    });
+                    checker->start("idevice_id", {"-l"});
+                });
+                pollTimer->start(500);
+            });
+
+        } else if (m_info.status == "No battery level") {
+            gbLayout->setContentsMargins(8, 3, 8, 8);
+
+            auto *trustSection = new QWidget;
+            auto *sectionLayout = new QVBoxLayout(trustSection);
+            sectionLayout->setContentsMargins(0, 4, 0, 0);
+            sectionLayout->setSpacing(6);
+
+            auto *infoLabel = new QLabel(
+                "usbmuxd can't connect to your device. Make sure you have tapped "
+                "\"Trust\" on your device when prompted to trust this computer.");
+            infoLabel->setWordWrap(true);
+            sectionLayout->addWidget(infoLabel);
+
+            auto *rescanBtn = new QPushButton("Try again");
+            sectionLayout->addWidget(rescanBtn, 0, Qt::AlignLeft);
+
+            gbLayout->addWidget(trustSection);
+
+            connect(rescanBtn, &QPushButton::clicked, this, [this] {
+                emit refreshRequested();
+                accept();
+            });
+
+        } else {
+            gbLayout->setContentsMargins(8, 3, 8, 32);
+        }
+    } else {
+        gbLayout->setContentsMargins(8, 3, 8, 32);
+    }
+
     v->addStretch();
 
     return w;

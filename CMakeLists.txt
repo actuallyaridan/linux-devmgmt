@@ -15,6 +15,7 @@ add_executable(devmgmt
     src/model/DeviceOps.cpp
     src/scanner/SysfsScanner.cpp
     src/scanner/DeviceScanner.cpp
+    src/monitor/UdevMonitor.cpp
     src/ui/MainWindow.cpp
     src/ui/DevicePropertiesDialog.cpp
     src/ui/DriverDetailsDialog.cpp
@@ -24,6 +25,7 @@ add_executable(devmgmt
 target_include_directories(devmgmt PRIVATE
     src/model
     src/scanner
+    src/monitor
     src/ui
 )
 

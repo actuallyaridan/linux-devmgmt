@@ -48,6 +48,25 @@ QString runCmd(const QString &cmd, const QStringList &args,
     return QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
 }
 
+enum class PkgMgr { None, Pacman, Dpkg, Rpm };
+
+PkgMgr detectPkgMgr() {
+    // Detect by database directory, not binary, so we correctly identify the
+    // host distro even when foreign tools are installed (e.g. via distrobox).
+    if (QDir("/var/lib/pacman").exists())
+        return PkgMgr::Pacman;
+    if (QDir("/var/lib/dpkg").exists())
+        return PkgMgr::Dpkg;
+    if (QDir("/var/lib/rpm").exists())
+        return PkgMgr::Rpm;
+    return PkgMgr::None;
+}
+
+PkgMgr activePkgMgr() {
+    static PkgMgr mgr = detectPkgMgr();
+    return mgr;
+}
+
 struct DriverInfo {
     QString version;
     QString date;
@@ -191,6 +210,60 @@ DriverInfo dkmsInfo(const QString &moduleName) {
 }
 
 
+struct PkgVersionDate { QString version; QString date; };
+
+QString pkgOwnerOf(const QString &filepath) {
+    switch (activePkgMgr()) {
+    case PkgMgr::Pacman:
+        return runCmd("pacman", {"-Qoq", filepath});
+    case PkgMgr::Dpkg: {
+        // Output: "pkgname: /path/to/file" (first match wins)
+        QString out = runCmd("dpkg", {"-S", filepath});
+        int colon = out.indexOf(':');
+        if (colon < 0) return {};
+        return out.left(colon).trimmed();
+    }
+    case PkgMgr::Rpm:
+        return runCmd("rpm", {"-qf", "--queryformat", "%{NAME}", filepath});
+    default:
+        return {};
+    }
+}
+
+PkgVersionDate queryPkgVersionDate(const QString &pkg) {
+    switch (activePkgMgr()) {
+    case PkgMgr::Pacman: {
+        QString out = runCmd("pacman", {"-Qi", pkg});
+        QString ver = pacmanFieldFrom(out, "Version");
+        return {ver, pacmanBuildDate(pkg, ver)};
+    }
+    case PkgMgr::Dpkg: {
+        // dpkg has no build date in its metadata; version only.
+        QString ver = runCmd("dpkg-query",
+                             {"-W", "--showformat=${Version}", pkg});
+        return {ver, {}};
+    }
+    case PkgMgr::Rpm: {
+        QString out = runCmd("rpm", {"-q", "--queryformat",
+                                     "%{VERSION}-%{RELEASE}\t%{BUILDTIME}",
+                                     pkg});
+        if (out.isEmpty()) return {};
+        QStringList parts = out.split('\t');
+        QString ver = parts.value(0).trimmed();
+        QString date;
+        if (parts.size() >= 2) {
+            bool ok = false;
+            qint64 ts = parts[1].trimmed().toLongLong(&ok);
+            if (ok && ts > 0)
+                date = formatDate(QDateTime::fromSecsSinceEpoch(ts));
+        }
+        return {ver, date};
+    }
+    default:
+        return {};
+    }
+}
+
 DriverInfo moduleDriverInfo(const QString &moduleName) {
     DriverInfo info;
     if (moduleName.isEmpty() || moduleName == "(kernel)") {
@@ -217,16 +290,14 @@ DriverInfo moduleDriverInfo(const QString &moduleName) {
         }
     }
 
-    QString pkg = runCmd("pacman", {"-Qoq", mi.filename});
+    QString pkg = pkgOwnerOf(mi.filename);
     if (!pkg.isEmpty()) {
-        QString pacmanOut = runCmd("pacman", {"-Qi", pkg});
-        QString pkgVer = pacmanFieldFrom(pacmanOut, "Version");
-        QString pkgDate = pacmanBuildDate(pkg, pkgVer);
+        PkgVersionDate pvd = queryPkgVersionDate(pkg);
         info.version = mi.version.isEmpty()
-            ? (pkgVer.isEmpty() ? kernelRelease() : pkgVer)
+            ? (pvd.version.isEmpty() ? kernelRelease() : pvd.version)
             : mi.version;
         QString known = knownVersionDate(info.version);
-        info.date = known.isEmpty() ? pkgDate : known;
+        info.date = known.isEmpty() ? pvd.date : known;
         info.author = mi.author;
         return info;
     }
@@ -481,6 +552,26 @@ Device makePciDevice(const QString &sysfsPath) {
     d.driverDate = di.date;
     d.driverAuthor = di.author;
     d.isDkms = di.isDkms;
+
+    // Non-PCI devices (platform/AMBA on ARM SoCs) have no vendor sysfs file,
+    // leaving the name as "Device :". Use the driver's modinfo description as
+    // a friendlier fallback, stripping the conventional trailing "driver" word.
+    if (vendor.isEmpty() && !d.driver.isEmpty()) {
+        QString desc = runCmd("modinfo", {"-F", "description", "--", d.driver});
+        if (!desc.isEmpty()) {
+            static const QRegularExpression kDriverSuffix(
+                R"(\s+[Dd]river[.]*\s*$)");
+            desc.remove(kDriverSuffix);
+            desc = desc.trimmed();
+        }
+        if (!desc.isEmpty())
+            d.name = desc;
+        else
+            d.name = d.driver;
+        if (d.manufacturer == "Vendor ")
+            d.manufacturer = "Unknown";
+    }
+
     d.location = friendlyLocation(sysfsPath, {});
     d.rawLocation = QFileInfo(sysfsPath).fileName();
     d.sysfsPciPath = sysfsPath;
@@ -586,7 +677,29 @@ QVector<Device> scanDisks() {
     return out;
 }
 
-QVector<Device> scanUsbDevices() {
+// Returns true if this USB device entry is a Bluetooth adapter — detected by
+// interface class E0/01 (Wireless/Bluetooth) or by the btusb driver binding.
+// Such devices are shown under "Bluetooth Radios" and should be excluded from
+// the generic USB device and unknown-device lists to avoid duplicates.
+bool isBluetoothUsbDevice(const QString &entry) {
+    QDir base("/sys/bus/usb/devices");
+    const QString ifPrefix = entry + ":";
+    for (const QString &iface : base.entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        if (!iface.startsWith(ifPrefix))
+            continue;
+        QString ifPath = QFileInfo(base.absoluteFilePath(iface)).canonicalFilePath();
+        if (readSysFile(ifPath + "/bInterfaceClass").trimmed().compare(
+                QStringLiteral("e0"), Qt::CaseInsensitive) == 0
+            && readSysFile(ifPath + "/bInterfaceSubClass").trimmed() == QLatin1String("01"))
+            return true;
+        if (QFileInfo(QFileInfo(ifPath + "/driver").symLinkTarget()).fileName()
+                == QLatin1String("btusb"))
+            return true;
+    }
+    return false;
+}
+
+QVector<Device> scanUsbDevices(const QSet<QString> &excluded = {}) {
     QVector<Device> out;
     QDir base("/sys/bus/usb/devices");
     if (!base.exists())
@@ -596,6 +709,10 @@ QVector<Device> scanUsbDevices() {
              QDir::AllEntries | QDir::NoDotAndDotDot)) {
         // Skip interfaces (contain colon) and root hubs.
         if (entry.contains(':') || entry.startsWith("usb"))
+            continue;
+        if (excluded.contains(entry))
+            continue;
+        if (isBluetoothUsbDevice(entry))
             continue;
 
         QString path = QFileInfo(
@@ -625,6 +742,133 @@ QVector<Device> scanUsbDevices() {
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
         d.location = friendlyLocation(path, entry);
+        out.append(d);
+    }
+    return out;
+}
+
+struct iOSBatteryInfo {
+    int  capacity = -1;
+    bool charging = false;
+};
+
+iOSBatteryInfo queryiOSBattery(const QString &udid) {
+    QProcess proc;
+    proc.start("ideviceinfo", {"-u", udid, "-q", "com.apple.mobile.battery"});
+    iOSBatteryInfo info;
+    if (!proc.waitForFinished(4000) || proc.exitCode() != 0)
+        return info;
+    for (const QString &line :
+         QString::fromUtf8(proc.readAllStandardOutput()).split('\n')) {
+        if (line.startsWith("BatteryCurrentCapacity:")) {
+            bool ok;
+            int v = line.section(':', 1).trimmed().toInt(&ok);
+            if (ok) info.capacity = v;
+        } else if (line.startsWith("BatteryIsCharging:")) {
+            info.charging = line.section(':', 1).trimmed().toLower() == "true";
+        }
+    }
+    return info;
+}
+
+// Returns a map keyed by UDID (with and without dashes) → battery info.
+// The sysfs /serial file contains the UDID without dashes; idevice_id -l may
+// return it with dashes (new-style UDIDs). Both forms are stored so the lookup
+// in scanPortableDevices() works regardless of which format sysfs exposes.
+QHash<QString, iOSBatteryInfo> scaniOSBatteries() {
+    QHash<QString, iOSBatteryInfo> result;
+    QProcess idProc;
+    idProc.start("idevice_id", {"-l"});
+    if (!idProc.waitForFinished(3000) || idProc.exitCode() != 0)
+        return result;
+    const QString udidList = QString::fromUtf8(
+        idProc.readAllStandardOutput()).trimmed();
+    if (udidList.isEmpty())
+        return result;
+    for (const QString &rawUdid : udidList.split('\n', Qt::SkipEmptyParts)) {
+        const QString udid = rawUdid.trimmed();
+        if (udid.isEmpty()) continue;
+        iOSBatteryInfo batt = queryiOSBattery(udid);
+        result.insert(udid, batt);
+        const QString udidNoDash = QString(udid).remove('-');
+        if (udidNoDash != udid)
+            result.insert(udidNoDash, batt);
+    }
+    return result;
+}
+
+bool isPortableUsbDevice(const QString &entry, const QString &canonPath) {
+    // Devices with a Still Image (MTP/PTP) interface — class 06
+    QDir base("/sys/bus/usb/devices");
+    QString prefix = entry + ":";
+    for (const QString &e : base.entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        if (!e.startsWith(prefix))
+            continue;
+        QString ifPath = QFileInfo(base.absoluteFilePath(e)).canonicalFilePath();
+        if (readSysFile(ifPath + "/bInterfaceClass").trimmed() == "06")
+            return true;
+        // ipheth: iPhone/iPad ethernet-over-USB interface
+        QString drv = QFileInfo(
+            QFileInfo(ifPath + "/driver").symLinkTarget()).fileName();
+        if (drv == "ipheth")
+            return true;
+    }
+    // Apple iOS devices connected before the user trusts the host show only
+    // vendor-specific interfaces — catch them by vendor + product name.
+    if (readSysFile(canonPath + "/idVendor").trimmed().toLower() == "05ac") {
+        QString product = readSysFile(canonPath + "/product").toLower();
+        if (product.contains("iphone") || product.contains("ipad")
+                || product.contains("ipod") || product.contains("apple tv"))
+            return true;
+    }
+    return false;
+}
+
+QVector<Device> scanPortableDevices(QSet<QString> *usedEntries) {
+    QVector<Device> out;
+    QDir base("/sys/bus/usb/devices");
+    if (!base.exists())
+        return out;
+
+    for (const QString &entry : base.entryList(
+             QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        if (entry.contains(':') || entry.startsWith("usb"))
+            continue;
+
+        QString path = QFileInfo(
+            base.absoluteFilePath(entry)).canonicalFilePath();
+
+        if (!isPortableUsbDevice(entry, path))
+            continue;
+
+        QString product = readSysFile(path + "/product");
+        QString mfr = readSysFile(path + "/manufacturer");
+        if (product.isEmpty())
+            continue;
+
+        Device d;
+        d.name = product;
+        d.manufacturer = mfr.isEmpty() ? "(Standard portable device)" : mfr;
+        d.status = "Working properly";
+        d.driver = QFileInfo(
+            QFileInfo(path + "/driver").symLinkTarget()).fileName();
+        DriverInfo di = moduleDriverInfo(d.driver);
+        d.driverVersion = di.version;
+        d.driverAuthor = di.author;
+        d.driverDate = di.date;
+        d.isDkms = di.isDkms;
+        d.rawLocation = entry;
+        d.location = friendlyLocation(path, entry);
+        QString productLower = product.toLower();
+        if (productLower.contains("ipad"))
+            d.iconName = "computer-apple-ipad";
+        else if (productLower.contains("iphone"))
+            d.iconName = "phone-apple-iphone";
+        else if (productLower.contains("ipod"))
+            d.iconName = "multimedia-player-apple-ipod-touch";
+
+        if (usedEntries)
+            usedEntries->insert(entry);
         out.append(d);
     }
     return out;
@@ -899,12 +1143,17 @@ QVector<Device> scanHidGeneric() {
             base.absoluteFilePath(entry)).canonicalFilePath();
         QString uevent = readSysFile(path + "/uevent");
         QString hidName;
+        QString hidId;
         for (const QString &line : uevent.split('\n')) {
-            if (line.startsWith("HID_NAME=")) {
+            if (line.startsWith("HID_NAME="))
                 hidName = line.mid(9).trimmed();
-                break;
-            }
+            else if (line.startsWith("HID_ID="))
+                hidId = line.mid(7).trimmed();
         }
+        // USB HID devices (bus 0003) are already shown under Universal Serial
+        // Bus devices — suppress the duplicate here, mirroring Win7's PnP tree.
+        if (hidId.left(4).toUpper() == "0003")
+            continue;
         if (hidName.isEmpty())
             hidName = entry;
         if (seenNames.contains(hidName))
@@ -949,22 +1198,86 @@ QVector<Device> scanBluetooth() {
 
         QString name;
         QString mfr;
-        QString usbDevicePath;
+        QString devicePath; // path used for friendlyLocation()
+        QString actualDriver;
         QDir deviceDir(path);
         int depth = 0;
+
+        // USB root hubs (usb1, usb2, …) carry "xHCI Host Controller" etc. as
+        // their product string.  Walking past the real BT USB device into the
+        // root hub would misname the adapter, so we skip those directories.
+        static const QRegularExpression kUsbRootHub(QStringLiteral(R"(^usb\d+$)"));
+
         while (deviceDir.cdUp() && ++depth <= 20) {
-            QString product = readSysFile(
-                deviceDir.absolutePath() + "/product");
-            QString manufacturer = readSysFile(
-                deviceDir.absolutePath() + "/manufacturer");
+            const QString dirPath = deviceDir.absolutePath();
+
+            // Capture the driver at the first sysfs level that exposes one
+            // (typically the USB interface, e.g. 1-14:1.0).
+            if (actualDriver.isEmpty())
+                actualDriver = driverNameFor(dirPath);
+
+            if (kUsbRootHub.match(QFileInfo(dirPath).fileName()).hasMatch())
+                continue;
+
+            // USB device with a product string — use it directly.
+            QString product = readSysFile(dirPath + "/product");
             if (!product.isEmpty()) {
                 name = product;
-                mfr = manufacturer;
-                usbDevicePath = deviceDir.absolutePath();
+                mfr  = readSysFile(dirPath + "/manufacturer");
+                devicePath = dirPath;
                 break;
             }
-            if (deviceDir.absolutePath() == "/sys/devices")
+
+            // USB device without a product string — look up via USB ID database.
+            const QString idVendor = readSysFile(dirPath + "/idVendor").trimmed().toLower();
+            if (!idVendor.isEmpty()) {
+                const QString idProduct = readSysFile(dirPath + "/idProduct").trimmed().toLower();
+                const IdsDb &db = usbIds();
+                const QString devName    = db.devices.value(idVendor + ":" + idProduct);
+                const QString vendorName = db.vendors.value(idVendor);
+                name = devName.isEmpty()
+                    ? (vendorName.isEmpty() ? QStringLiteral("Bluetooth Adapter")
+                                            : vendorName + QStringLiteral(" Bluetooth Adapter"))
+                    : devName;
+                mfr = vendorName;
+                devicePath = dirPath;
                 break;
+            }
+
+            // PCIe-native Bluetooth — look up via PCI ID database.
+            if (QFile::exists(dirPath + "/vendor") && QFile::exists(dirPath + "/class")) {
+                const QString pciVendor  = readHexId(dirPath + "/vendor");
+                const QString pciDevice  = readHexId(dirPath + "/device");
+                const IdsDb &db = pciIds();
+                const QString devName    = db.devices.value(pciVendor + ":" + pciDevice);
+                const QString vendorName = db.vendors.value(pciVendor);
+                name = devName.isEmpty()
+                    ? (vendorName.isEmpty() ? QStringLiteral("Bluetooth Adapter")
+                                            : vendorName + QStringLiteral(" Bluetooth Adapter"))
+                    : devName;
+                mfr = vendorName;
+                devicePath = dirPath;
+                break;
+            }
+
+            if (dirPath == "/sys/devices")
+                break;
+        }
+
+        // Driver modinfo description as fallback when the ID database yielded
+        // nothing specific.  Strips " driver" and any trailing version token so
+        // "Generic Bluetooth USB driver ver 0.8" becomes "Generic Bluetooth USB".
+        if ((name.isEmpty() || name == QStringLiteral("Bluetooth Adapter"))
+                && !actualDriver.isEmpty()) {
+            QString desc = runCmd("modinfo", {"-F", "description", "--", actualDriver});
+            if (!desc.isEmpty()) {
+                static const QRegularExpression kDriverSuffix(
+                    QStringLiteral(R"(\s+[Dd]river\b.*)"));
+                desc.remove(kDriverSuffix);
+                desc = desc.trimmed();
+            }
+            if (!desc.isEmpty())
+                name = desc;
         }
 
         if (name.isEmpty())
@@ -973,7 +1286,7 @@ QVector<Device> scanBluetooth() {
         Device d;
         d.name = name;
         d.status = "Working properly";
-        d.driver = "btusb";
+        d.driver = actualDriver.isEmpty() ? QStringLiteral("btusb") : actualDriver;
         d.manufacturer = mfr.isEmpty() ? "(Standard Bluetooth device)" : mfr;
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
@@ -983,8 +1296,8 @@ QVector<Device> scanBluetooth() {
         d.rawLocation = entry;
         bool ok;
         int hciNum = entry.mid(3).toInt(&ok);
-        if (!usbDevicePath.isEmpty())
-            d.location = friendlyLocation(usbDevicePath, {});
+        if (!devicePath.isEmpty())
+            d.location = friendlyLocation(devicePath, {});
         else
             d.location = ok ? QString("Bluetooth adapter %1").arg(hciNum) : entry;
         out.append(d);
@@ -1109,13 +1422,15 @@ QVector<Device> scanHidBatteries() {
             name = entry;
 
         QString capacity = readSysFile(path + "/capacity");
-        QString status = readSysFile(path + "/status");
+        QString capacityLevel = readSysFile(path + "/capacity_level");
         QString deviceStatus = "Working properly";
         if (!capacity.isEmpty())
             deviceStatus = QString("Battery level: %1%").arg(capacity);
+        else if (!capacityLevel.isEmpty() && capacityLevel != "Unknown")
+            deviceStatus = QString("Battery level: %1").arg(capacityLevel);
 
         Device d;
-        d.name = name;
+        d.name = "Battery on " + name;
         d.manufacturer = mfr.isEmpty() ? "(Standard)" : mfr;
         d.status = deviceStatus;
         d.driver = "usbhid";
@@ -1211,6 +1526,7 @@ QVector<Device> scanBatteries() {
     QDir base("/sys/class/power_supply");
     if (!base.exists())
         return out;
+    const QHash<QString, iOSBatteryInfo> iosBatteries = scaniOSBatteries();
     QString hostModel = dmiProductName();
     for (const QString &entry : base.entryList(
              QDir::AllEntries | QDir::NoDotAndDotDot)) {
@@ -1221,21 +1537,89 @@ QVector<Device> scanBatteries() {
         if (entry.contains("hidpp", Qt::CaseInsensitive))
             continue;
 
+        QString canonicalPath = QFileInfo(path).canonicalFilePath();
         QString model = readSysFile(path + "/model_name");
         QString mfr = readSysFile(path + "/manufacturer");
         Device d;
-        d.name = model.isEmpty() ? entry : model;
+
+        if (entry.startsWith("apple_mfi_fastcharge_")) {
+            // Walk up two levels: power_supply/<entry> → power_supply/ → USB device dir
+            QDir dir(canonicalPath);
+            dir.cdUp();
+            dir.cdUp();
+            QString usbProduct = readSysFile(dir.absolutePath() + "/product").trimmed();
+            QString usbMfr = readSysFile(dir.absolutePath() + "/manufacturer").trimmed();
+            if (usbProduct.isEmpty())
+                usbProduct = "Apple Device";
+            d.name = "Battery on " + usbProduct;
+            d.location = "on " + usbProduct;
+            d.manufacturer = usbMfr.isEmpty() ? "Apple Inc." : usbMfr;
+            // Read battery level via libimobiledevice if the device is trusted.
+            d.status = "No battery level";
+            if (!iosBatteries.isEmpty()) {
+                const QString usbSerial = readSysFile(
+                    dir.absolutePath() + "/serial").trimmed();
+                if (!usbSerial.isEmpty() && iosBatteries.contains(usbSerial)) {
+                    const iOSBatteryInfo &batt = iosBatteries.value(usbSerial);
+                    if (batt.capacity >= 0) {
+                        d.status = QString("Battery level: %1%").arg(batt.capacity);
+                        if (batt.charging)
+                            d.status += " (charging)";
+                    }
+                }
+            }
+            d.driver = "apple-mfi-fastcharge";
+            DriverInfo di = moduleDriverInfo(d.driver);
+            d.driverVersion = di.version;
+            d.driverAuthor = di.author;
+            d.driverDate = di.date;
+            d.rawLocation = entry;
+            out.append(d);
+            continue;
+        }
+
+        if (isControllerBattery(canonicalPath)) {
+            QString hidName;
+            QDir dir(canonicalPath);
+            int depth = 0;
+            while (dir.cdUp() && ++depth <= 20) {
+                QString uevent = readSysFile(dir.absolutePath() + "/uevent");
+                for (const QString &line : uevent.split('\n')) {
+                    if (line.startsWith("HID_NAME=")) {
+                        hidName = line.mid(9).trimmed();
+                        break;
+                    }
+                }
+                if (!hidName.isEmpty()) break;
+                if (dir.absolutePath() == "/sys/devices") break;
+            }
+            if (hidName.isEmpty())
+                hidName = model.isEmpty() ? entry : model;
+            d.name = "Battery on " + hidName;
+            d.location = "on " + hidName;
+            QString capacity = readSysFile(path + "/capacity");
+            QString capacityLevel = readSysFile(path + "/capacity_level");
+            if (!capacity.isEmpty())
+                d.status = QString("Battery level: %1%").arg(capacity);
+            else if (!capacityLevel.isEmpty() && capacityLevel != "Unknown")
+                d.status = QString("Battery level: %1").arg(capacityLevel);
+            else
+                d.status = "Working properly";
+        } else {
+            d.name = model.isEmpty() ? entry : model;
+            d.location = hostModel.isEmpty()
+                ? friendlyLocation(canonicalPath, entry)
+                : "on " + hostModel;
+            d.status = "Working properly";
+        }
+
         d.manufacturer = mfr.isEmpty() ? "(Standard)" : mfr;
-        d.status = "Working properly";
         d.driver = "battery";
         DriverInfo di = moduleDriverInfo(d.driver);
         d.driverVersion = di.version;
         d.driverAuthor = di.author;
         d.driverDate = di.date;
         d.rawLocation = entry;
-        d.location = hostModel.isEmpty()
-            ? friendlyLocation(QFileInfo(path).canonicalFilePath(), entry)
-            : "on " + hostModel;
         out.append(d);
     }
     return out;
@@ -1257,10 +1641,12 @@ QVector<Device> scanGameControllers() {
         if (!isControllerBattery(path))
             continue;
 
-        // walk up sysfs to find the HID device name and driver
+        // walk up sysfs to find the HID device name, driver, and bus type
         QString name;
         QString mfr;
         QString driverName;
+        QString hidId;   // "BUS:VENDOR:PRODUCT" — BUS 0005=BT, 0003=USB
+        QString hidUniq; // unique address (BT MAC for Bluetooth devices)
         QDir dir(path);
         int depth = 0;
         while (dir.cdUp() && ++depth <= 20) {
@@ -1271,6 +1657,10 @@ QVector<Device> scanGameControllers() {
                     name = line.mid(9).trimmed();
                 else if (line.startsWith("DRIVER=") && driverName.isEmpty())
                     driverName = line.mid(7).trimmed();
+                else if (line.startsWith("HID_ID=") && hidId.isEmpty())
+                    hidId = line.mid(7).trimmed();
+                else if (line.startsWith("HID_UNIQ=") && hidUniq.isEmpty())
+                    hidUniq = line.mid(9).trimmed();
             }
             if (mfr.isEmpty()) {
                 QString m = readSysFile(dirPath + "/manufacturer");
@@ -1286,23 +1676,37 @@ QVector<Device> scanGameControllers() {
         if (name.isEmpty())
             name = entry;
 
-        // extract bluetooth address if present
-        QString btAddr;
-        static const QRegularExpression btAddrRe(
-            R"(([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})$)");
-        auto addrMatch = btAddrRe.match(entry);
-        if (addrMatch.hasMatch())
-            btAddr = addrMatch.captured(1);
+        // HID_UNIQ holds the BT MAC for Bluetooth devices; fall back to
+        // extracting a MAC from the entry name for older kernel layouts.
+        QString btAddr = hidUniq;
+        if (btAddr.isEmpty()) {
+            static const QRegularExpression btAddrRe(
+                R"(([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})$)");
+            auto addrMatch = btAddrRe.match(entry);
+            if (addrMatch.hasMatch())
+                btAddr = addrMatch.captured(1);
+        }
 
-        QString capacity = readSysFile(path + "/capacity");
         QString deviceStatus = "Working properly";
-        if (!capacity.isEmpty())
-            deviceStatus = QString("Battery level: %1%").arg(capacity);
+
+        // Derive manufacturer from HID_ID vendor field (USB vendor ID registry).
+        // HID_ID format: "BUS:VENDOR:PRODUCT" — vendor field is 8 hex digits,
+        // last 4 match the USB/BT vendor IDs used in usb.ids.
+        QString manufacturer = mfr;
+        if (manufacturer.isEmpty() && !hidId.isEmpty()) {
+            QStringList hidParts = hidId.split(':');
+            if (hidParts.size() >= 2) {
+                QString vendorHex = hidParts[1].right(4).toLower();
+                QString looked = usbIds().vendors.value(vendorHex);
+                if (!looked.isEmpty())
+                    manufacturer = looked;
+            }
+        }
 
         Device d;
         d.name = name;
-        d.manufacturer = mfr.isEmpty()
-            ? "(Standard game controller)" : mfr;
+        d.manufacturer = manufacturer.isEmpty()
+            ? "(Standard game controller)" : manufacturer;
         d.status = deviceStatus;
         d.driver = driverName;
         DriverInfo di = moduleDriverInfo(d.driver);
@@ -1312,7 +1716,23 @@ QVector<Device> scanGameControllers() {
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
         d.btAddress = btAddr;
-        d.location = friendlyLocation(path, entry);
+        // HID_ID first field is the kernel bus type: 0005=BT, 0003=USB.
+        // Fall back to sysfs path heuristics if HID_ID is unavailable.
+        if (!hidId.isEmpty()) {
+            QString busHex = hidId.left(4).toUpper();
+            if (busHex == "0005")
+                d.location = "connected via Bluetooth";
+            else if (busHex == "0003")
+                d.location = "connected via USB";
+            else
+                d.location = "Unknown";
+        } else if (!btAddr.isEmpty() || path.contains("/bluetooth/")) {
+            d.location = "connected via Bluetooth";
+        } else if (path.contains("/usb")) {
+            d.location = "connected via USB";
+        } else {
+            d.location = "Unknown";
+        }
         out.append(d);
     }
     return out;
@@ -1549,6 +1969,41 @@ QVector<Device> scanBluetoothAudio() {
     return out;
 }
 
+QVector<Device> scanUnknownUsbDevices() {
+    QVector<Device> out;
+    QDir base("/sys/bus/usb/devices");
+    if (!base.exists())
+        return out;
+    for (const QString &entry : base.entryList(
+             QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        if (entry.contains(':') || entry.startsWith("usb"))
+            continue;
+        if (isBluetoothUsbDevice(entry))
+            continue;
+        QString path = QFileInfo(
+            base.absoluteFilePath(entry)).canonicalFilePath();
+        if (readSysFile(path + "/bDeviceClass") == "09")
+            continue;
+        if (!readSysFile(path + "/product").isEmpty())
+            continue;
+        QString vendorHex = readSysFile(path + "/idVendor").trimmed().toLower();
+        QString productHex = readSysFile(path + "/idProduct").trimmed().toLower();
+        if (vendorHex.isEmpty())
+            continue;
+        Device d;
+        QString vendorName = usbIds().vendors.value(vendorHex);
+        d.name = vendorName.isEmpty()
+            ? QString("Unknown device %1:%2").arg(vendorHex, productHex)
+            : QString("Unknown %1 device").arg(vendorName);
+        d.manufacturer = vendorName.isEmpty() ? "Unknown" : vendorName;
+        d.status = "Unknown";
+        d.rawLocation = entry;
+        d.location = friendlyLocation(path, entry);
+        out.append(d);
+    }
+    return out;
+}
+
 } // namespace
 
 QVector<DeviceCategory> scanDevices() {
@@ -1569,15 +2024,18 @@ QVector<DeviceCategory> scanDevices() {
     addIfAny("Disk drives", "drive-harddisk", scanDisks());
     addIfAny("Display adapters", "video-display", scanPciByClass("03"));
     addIfAny("DVD/CD-ROM drives", "media-optical", scanOpticalDrives());
-    addIfAny("Human Interface Devices", "input-gaming", scanHidGeneric());
+    addIfAny("Human Interface Devices", "input_devices_settings", scanHidGeneric());
     addIfAny("IDE ATA/ATAPI controllers", "drive-harddisk",
              scanIdeControllers());
     addIfAny("Keyboards", "input-keyboard", scanKeyboards());
     addIfAny("Mice and other pointing devices", "input-mouse", scanMice());
     addIfAny("Monitors", "video-display", scanMonitors());
-    addIfAny("Network adapters", "folder-network", scanNetwork());
+    addIfAny("Network adapters", "network-card", scanNetwork());
+    QSet<QString> portableEntries;
+    addIfAny("Portable Devices", "smartphone",
+             scanPortableDevices(&portableEntries));
     addIfAny("Processors", "cpu", scanCpus());
-    addIfAny("Security devices", "drive-harddisk-encrypted", scanTpm());
+    addIfAny("Security Devices", "drive-harddisk-encrypted", scanTpm());
     auto soundDevs = scanSoundCards();
     soundDevs += scanBluetoothAudio();
     addIfAny("Sound, video and game controllers", "kmix", soundDevs);
@@ -1590,7 +2048,8 @@ QVector<DeviceCategory> scanDevices() {
     addIfAny("Universal Serial Bus controllers",
              "drive-removable-media-usb", scanUsbControllers());
     addIfAny("Universal Serial Bus devices",
-             "drive-removable-media-usb", scanUsbDevices());
+             "drive-removable-media-usb", scanUsbDevices(portableEntries));
+    addIfAny("Unknown devices", "dialog-question", scanUnknownUsbDevices());
 
     QVector<Device> missing = scanBlacklistedMissing(cats);
     if (!missing.isEmpty())

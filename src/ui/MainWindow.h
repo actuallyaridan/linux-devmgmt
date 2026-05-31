@@ -5,8 +5,10 @@
 #include "DeviceData.h"
 
 class QTreeView;
+class QTimer;
 class DeviceModel;
 class DeviceScanner;
+class UdevMonitor;
 class QAction;
 
 class MainWindow : public QMainWindow {
@@ -29,6 +31,8 @@ private:
     QTreeView *m_tree;
     DeviceModel *m_model;
     DeviceScanner *m_scanner = nullptr;
+    UdevMonitor *m_udevMonitor = nullptr;
+    QTimer *m_rescanTimer = nullptr;
 
     QAction *m_actProperties;
     QAction *m_actUpdateDriver;
@@ -42,4 +46,8 @@ private:
     void updateActionStates();
     QSet<QString> saveExpandedState() const;
     void restoreExpandedState(const QSet<QString> &expanded);
+    QModelIndex findDevice(const QString &name, const QString &driver) const;
+
+    QString m_pendingReopenName;
+    QString m_pendingReopenDriver;
 };

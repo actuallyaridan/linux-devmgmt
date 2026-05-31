@@ -1,4 +1,5 @@
 #include "UpdateDriverDialog.h"
+#include "IconHelper.h"
 
 #include <QDir>
 #include <QVBoxLayout>
@@ -65,7 +66,7 @@ UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
         "Search automatically for updated driver software",
         "Discover will search your computer and the Internet for "
         "the latest driver software for your device.");
-    autoBtn->setIcon(QIcon::fromTheme("stock_next"));
+    autoBtn->setIcon(themeIcon({"go-next", "stock_next", "go-forward"}));
     autoBtn->setIconSize(QSize(16, 16));
     autoBtn->setStyleSheet(flatStyle);
     cv->addWidget(autoBtn);
@@ -74,7 +75,7 @@ UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
     auto *browseBtn = new QCommandLinkButton(
         "Browse my computer for driver software",
         "Locate and install driver software manually.");
-    browseBtn->setIcon(QIcon::fromTheme("stock_next"));
+    browseBtn->setIcon(themeIcon({"go-next", "stock_next", "go-forward"}));
     browseBtn->setIconSize(QSize(16, 16));
     browseBtn->setStyleSheet(flatStyle);
     cv->addWidget(browseBtn);

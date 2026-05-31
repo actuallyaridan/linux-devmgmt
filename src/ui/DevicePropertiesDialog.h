@@ -32,6 +32,8 @@ public:
 
 signals:
     void disableToggled(bool nowDisabled);
+    void usbmuxdStarted();
+    void refreshRequested();
 
 protected:
     void showEvent(QShowEvent *e) override;

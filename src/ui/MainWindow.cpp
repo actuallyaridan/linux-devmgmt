@@ -6,6 +6,8 @@
 #include "DeviceScanner.h"
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
+#include "UdevMonitor.h"
+#include "IconHelper.h"
 
 #include <QTreeView>
 #include <QToolBar>
@@ -24,6 +26,7 @@
 #include <QHBoxLayout>
 #include <QFrame>
 #include <QFont>
+#include <QTimer>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("Device Manager");
@@ -53,6 +56,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     buildToolbar();
     statusBar()->showMessage("Scanning for hardware...");
     startScan();
+
+    m_rescanTimer = new QTimer(this);
+    m_rescanTimer->setSingleShot(true);
+    m_rescanTimer->setInterval(500);
+    connect(m_rescanTimer, &QTimer::timeout, this, &MainWindow::refresh);
+
+    m_udevMonitor = new UdevMonitor(this);
+    connect(m_udevMonitor, &UdevMonitor::deviceChanged,
+            m_rescanTimer, qOverload<>(&QTimer::start));
 }
 
 MainWindow::~MainWindow() {
@@ -123,6 +135,16 @@ void MainWindow::onScanComplete(const QString &hostName,
 
     statusBar()->showMessage("Ready");
     updateActionStates();
+
+    if (!m_pendingReopenName.isEmpty()) {
+        QModelIndex idx = findDevice(m_pendingReopenName, m_pendingReopenDriver);
+        m_pendingReopenName.clear();
+        m_pendingReopenDriver.clear();
+        if (idx.isValid()) {
+            m_tree->setCurrentIndex(idx);
+            showProperties();
+        }
+    }
 }
 
 void MainWindow::onSelectionChanged() {
@@ -287,7 +309,7 @@ void MainWindow::buildMenus() {
         auto *nameLabel = new QLabel("Device Manager");
 
         auto *companyLabel = new QLabel("@actuallyaridan");
-        auto *versionLabel = new QLabel("Version: 1.1.2");
+        auto *versionLabel = new QLabel("Version: 2.0");
 
         auto *infoLayout = new QVBoxLayout;
         infoLayout->addWidget(nameLabel);
@@ -354,23 +376,25 @@ void MainWindow::buildToolbar() {
     tb->setIconSize(QSize(16, 16));
     tb->setToolButtonStyle(Qt::ToolButtonIconOnly);
 
-    tb->addAction(QIcon::fromTheme("go-previous"), "Back");
-    tb->addAction(QIcon::fromTheme("go-next"), "Forward");
+    tb->addAction(themeIcon({"go-previous", "arrow-left"}), "Back");
+    tb->addAction(themeIcon({"go-next", "arrow-right"}), "Forward");
     tb->addSeparator();
-    tb->addAction(QIcon::fromTheme("view-list-tree"),
+    tb->addAction(themeIcon({"view-list-tree", "format-justify-fill",
+                             "format-list-unordered"}),
                   "Show/hide console tree");
-    m_actProperties->setIcon(QIcon::fromTheme("document-properties"));
+    m_actProperties->setIcon(
+        themeIcon({"document-properties", "configure"}));
     tb->addAction(m_actProperties);
-    tb->addAction(QIcon::fromTheme("help-contents"), "Help");
-    tb->addAction(QIcon::fromTheme("view-refresh"),
+    tb->addAction(themeIcon({"help-contents", "help-browser"}), "Help");
+    tb->addAction(themeIcon({"view-refresh", "reload"}),
                   "Scan for hardware changes", this, &MainWindow::refresh);
     tb->addSeparator();
     m_actUpdateDriver->setIcon(
-        QIcon::fromTheme("system-software-update"));
+        themeIcon({"system-software-update", "software-update-available"}));
     tb->addAction(m_actUpdateDriver);
-    m_actUninstall->setIcon(QIcon::fromTheme("edit-delete"));
+    m_actUninstall->setIcon(themeIcon({"edit-delete", "list-remove"}));
     tb->addAction(m_actUninstall);
-    tb->addAction(QIcon::fromTheme("list-add"), "Add legacy hardware");
+    tb->addAction(themeIcon({"list-add", "add"}), "Add legacy hardware");
 }
 
 void MainWindow::showContextMenu(const QPoint &pos) {
@@ -413,6 +437,24 @@ void MainWindow::showContextMenu(const QPoint &pos) {
     menu.exec(m_tree->viewport()->mapToGlobal(pos));
 }
 
+QModelIndex MainWindow::findDevice(const QString &name,
+                                   const QString &driver) const {
+    std::function<QModelIndex(const QModelIndex &)> walk =
+        [&](const QModelIndex &parent) -> QModelIndex {
+        for (int i = 0; i < m_model->rowCount(parent); ++i) {
+            QModelIndex idx = m_model->index(i, 0, parent);
+            if (m_model->deviceField(idx, "name").toString() == name
+                    && m_model->deviceField(idx, "driver").toString() == driver)
+                return idx;
+            QModelIndex found = walk(idx);
+            if (found.isValid())
+                return found;
+        }
+        return {};
+    };
+    return walk(m_tree->rootIndex());
+}
+
 void MainWindow::showProperties() {
     auto idx = m_tree->currentIndex();
     if (!idx.isValid())
@@ -448,6 +490,13 @@ void MainWindow::showProperties() {
     DevicePropertiesDialog dlg(info, this);
     connect(&dlg, &DevicePropertiesDialog::disableToggled,
             this, &MainWindow::refresh);
+    auto scheduleReopen = [this, info] {
+        m_pendingReopenName   = info.name;
+        m_pendingReopenDriver = info.driver;
+        refresh();
+    };
+    connect(&dlg, &DevicePropertiesDialog::usbmuxdStarted,  this, scheduleReopen);
+    connect(&dlg, &DevicePropertiesDialog::refreshRequested, this, scheduleReopen);
     dlg.exec();
 }
 
