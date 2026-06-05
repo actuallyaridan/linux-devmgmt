@@ -309,7 +309,7 @@ void MainWindow::buildMenus() {
         auto *nameLabel = new QLabel("Device Manager");
 
         auto *companyLabel = new QLabel("@actuallyaridan");
-        auto *versionLabel = new QLabel("Version: 2.0");
+        auto *versionLabel = new QLabel("Version: 2.0.3.1");
 
         auto *infoLayout = new QVBoxLayout;
         infoLayout->addWidget(nameLabel);
