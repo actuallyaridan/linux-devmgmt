@@ -19,6 +19,23 @@
 | <img src="./screenshots/olddriver.png" alt="The same Driver tab of the Properties window, but this time showing an older unmaintained driver's date and version."> | <img src="./screenshots/details.png" alt="The Details tab, shwoing a dropdown with a large text area."> | <img src="./screenshots/resources.png" alt="The Resources tab, shwoing a information about a deviecs resources like IRQ and similar."> |
 
 
+## Installation
+
+### Arch / CachyOS (AUR)
+
+```bash
+yay -S linux-devmgmt
+```
+
+### Pre-built binaries
+
+Download the latest binary for your architecture from the [Releases](https://github.com/actuallyaridan/linux-devmgmt/releases/latest) page and place it somewhere in your `$PATH`:
+
+```bash
+chmod +x devmgmt-x86_64
+sudo mv devmgmt-x86_64 /usr/local/bin/devmgmt
+```
+
 ## Building
 
 ### Arch / CachyOS
