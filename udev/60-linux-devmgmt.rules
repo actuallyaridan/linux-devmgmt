@@ -1,0 +1,14 @@
+# linux-devmgmt udev rules
+#
+# Grants the active logged-in user read/write access to HID raw devices so
+# the device manager can query battery level via HID feature reports.
+# TAG+="uaccess" uses systemd-logind seat management: only the user at the
+# physical seat receives access; access is revoked on logout.
+#
+# This covers:
+#   - MonsGeek keyboards (VID 0x3151) using the proprietary GET_DONGLE_STATUS
+#     and GET_BATTERY commands over the vendor HID interface.
+#   - Any other keyboard or peripheral that reports battery via the standard
+#     HID Battery System usage page (0x85) in a Feature report.
+
+SUBSYSTEM=="hidraw", TAG+="uaccess"

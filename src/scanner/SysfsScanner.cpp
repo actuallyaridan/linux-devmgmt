@@ -15,6 +15,11 @@
 #include <QProcess>
 #include <QRegularExpression>
 
+#include <fcntl.h>
+#include <linux/hidraw.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 namespace {
 
 // Resolve data-file directories via environment variables so that Nix (and
@@ -2004,6 +2009,294 @@ QVector<Device> scanUnknownUsbDevices() {
     return out;
 }
 
+// Returns true if the first Usage Page declared in a HID report descriptor
+// is vendor-specific (0xFF00–0xFFFF). Used to identify MonsGeek raw-HID
+// config interfaces that accept battery query commands.
+static bool startsWithVendorUsagePage(const quint8 *desc, int len) {
+    for (int i = 0; i < len; ) {
+        quint8 item = desc[i];
+        if (item == 0xFE) { if (i + 2 >= len) break; i += 3 + desc[i + 1]; continue; }
+        int sz = item & 3, btype = (item >> 2) & 3, btag = (item >> 4) & 0xF;
+        int nb = (sz == 3) ? 4 : sz;
+        if (i + 1 + nb > len) break;
+        quint32 v = 0;
+        for (int b = 0; b < nb; ++b) v |= (quint32)desc[i + 1 + b] << (8 * b);
+        i += 1 + nb;
+        if (btype == 1 && btag == 0) // first Usage Page
+            return (v >> 8) == 0xFF;
+    }
+    return false;
+}
+
+struct MonsGeekBattery { int level = -1; bool charging = false; bool hasData = false; };
+
+// Queries battery level from a MonsGeek keyboard via the proprietary
+// GET_DONGLE_STATUS (0xF7) or GET_BATTERY (0x83) feature report command.
+// Protocol: HIDIOCSFEATURE sends the command; HIDIOCGFEATURE reads the response.
+// Response layout (buf[0] = echoed report ID 0x00):
+//   Wireless (0xF7): buf[2]=has_response, buf[3]=battery%, buf[5]=charging
+//   Wired    (0x83): buf[1]=0x83 echo,   buf[2]=0xAA ok,   buf[3]=battery%
+static MonsGeekBattery queryMonsGeekBattery(int fd, bool isDongle) {
+    MonsGeekBattery r;
+    quint8 cmd   = isDongle ? 0xF7u : 0x83u;
+    quint8 cksum = (quint8)(255u - cmd);
+
+    quint8 sbuf[65] = {};
+    // sbuf[0] = 0x00 (report ID, already zero)
+    sbuf[1] = cmd;
+    sbuf[7] = cksum;
+    if (::ioctl(fd, HIDIOCSFEATURE(sizeof(sbuf)), sbuf) < 0)
+        return r;
+
+    quint8 gbuf[65] = {};
+    if (::ioctl(fd, HIDIOCGFEATURE(sizeof(gbuf)), gbuf) < 0)
+        return r;
+
+    if (isDongle) {
+        if (gbuf[2] == 0) return r;   // has_response=0: keyboard not seen by dongle yet
+        r.hasData  = true;
+        r.level    = (int)gbuf[3];
+        r.charging = (gbuf[5] != 0);
+    } else {
+        if (gbuf[2] != 0xAA) return r; // 0xAA = success marker
+        r.hasData = true;
+        r.level   = (int)gbuf[3];
+    }
+    return r;
+}
+
+// Minimal HID report descriptor parser: returns the set of report IDs that
+// contain an "Absolute State of Charge" (usage 0x35 in Battery System page
+// 0x85) or "Remaining Capacity" (usage 0x44 in Power Device page 0x84)
+// inside a Feature collection.
+static QSet<int> hidBatteryReportIds(const quint8 *desc, int len) {
+    QSet<int> result;
+    int usagePage = 0, reportId = 0;
+    bool hasBattUsage = false;
+
+    for (int i = 0; i < len; ) {
+        quint8 item = desc[i];
+        if (item == 0xFE) {                     // long item
+            if (i + 2 >= len) break;
+            i += 3 + (int)(quint8)desc[i + 1];
+            continue;
+        }
+        int sz    = item & 0x03;
+        int btype = (item >> 2) & 0x03;
+        int btag  = (item >> 4) & 0x0F;
+        int nb    = (sz == 3) ? 4 : sz;
+        if (i + 1 + nb > len) break;
+
+        quint32 v = 0;
+        for (int b = 0; b < nb; ++b)
+            v |= (quint32)(quint8)desc[i + 1 + b] << (8 * b);
+        i += 1 + nb;
+
+        switch (btype) {
+        case 1: // Global
+            if (btag == 0) usagePage = (int)v;  // Usage Page
+            if (btag == 8) reportId  = (int)v;  // Report ID
+            break;
+        case 2: // Local
+            if (btag == 0 && ((usagePage == 0x85 && v == 0x35) ||   // Abs SoC
+                              (usagePage == 0x84 && v == 0x44)))     // Remaining Cap
+                hasBattUsage = true;
+            break;
+        case 0: // Main
+            if (btag == 0xB && hasBattUsage)    // Feature
+                result.insert(reportId);
+            hasBattUsage = false;               // Local state resets after any Main item
+            break;
+        }
+    }
+    return result;
+}
+
+// Sends HIDIOCGFEATURE for the given report ID, returns 0-100 on success, -1
+// if the report can't be read or doesn't contain a valid percentage.
+static int readHidFeatureBattery(int fd, int reportId) {
+    quint8 buf[65] = {};
+    buf[0] = (quint8)reportId;
+    int ret = ::ioctl(fd, HIDIOCGFEATURE(sizeof(buf)), buf);
+    if (ret < 0)
+        return -1;
+    // buf[0] is the echoed report ID; data starts at buf[1].
+    // The Absolute State of Charge is 0-100%; scan the first 8 data bytes.
+    for (int b = 1; b < ret && b <= 8; ++b) {
+        if (buf[b] <= 100)
+            return (int)buf[b];
+    }
+    return -1;
+}
+
+// Scans /sys/class/hidraw for HID devices that advertise a Battery System
+// feature report in their report descriptor but have no kernel power_supply
+// entry (e.g. some 2.4 GHz wireless keyboards whose battery the kernel doesn't
+// surface via the standard power_supply class).
+QVector<Device> scanHidrawBatteries() {
+    QVector<Device> out;
+
+    // Collect canonical sysfs paths of HID devices already covered by a
+    // kernel power_supply entry so we don't create duplicate entries.
+    QSet<QString> coveredHidPaths;
+    {
+        QDir ps("/sys/class/power_supply");
+        for (const QString &e : ps.entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
+            QString canon = QFileInfo(ps.absoluteFilePath(e)).canonicalFilePath();
+            if (readSysFile(canon + "/type") == QLatin1String("Battery"))
+                coveredHidPaths.insert(canon);
+        }
+    }
+
+    QDir hidrawDir("/sys/class/hidraw");
+    if (!hidrawDir.exists())
+        return out;
+
+    QSet<QString> seenHidDevs;
+
+    for (const QString &entry : hidrawDir.entryList(
+             QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        // Resolve the HID device that backs this hidraw node.
+        QString hidDevPath = QFileInfo(
+            hidrawDir.absoluteFilePath(entry) + "/device"
+        ).canonicalFilePath();
+        if (hidDevPath.isEmpty() || seenHidDevs.contains(hidDevPath))
+            continue;
+
+        // Skip if a power_supply entry already covers this HID device.
+        bool covered = false;
+        for (const QString &cp : coveredHidPaths) {
+            if (cp.startsWith(hidDevPath + '/')) { covered = true; break; }
+        }
+        if (covered)
+            continue;
+
+        QString devNode = "/dev/" + entry;
+
+        // O_RDWR is required for HIDIOCGFEATURE; fall back to O_RDONLY for
+        // descriptor-only detection when the user only has read permission.
+        int fd = ::open(devNode.toLocal8Bit().constData(), O_RDWR | O_NONBLOCK);
+        bool canGetFeature = (fd >= 0);
+        if (fd < 0)
+            fd = ::open(devNode.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK);
+        if (fd < 0)
+            continue;
+
+        // Read the HID report descriptor.
+        int descSize = 0;
+        struct hidraw_report_descriptor rptDesc = {};
+        bool gotDesc = (::ioctl(fd, HIDIOCGRDESCSIZE, &descSize) >= 0
+                        && descSize > 0);
+        if (gotDesc) {
+            rptDesc.size = (unsigned int)descSize;
+            gotDesc = (::ioctl(fd, HIDIOCGRDESC, &rptDesc) >= 0);
+        }
+
+        if (!gotDesc) {
+            ::close(fd);
+            continue;
+        }
+
+        const quint8 *descBytes = reinterpret_cast<const quint8 *>(rptDesc.value);
+        int           descLen   = (int)rptDesc.size;
+
+        // Resolve a human-readable name from the HID device's sysfs uevent.
+        QString hidName, hidId;
+        for (const QString &line : readSysFile(hidDevPath + "/uevent").split('\n')) {
+            if (line.startsWith("HID_NAME="))
+                hidName = line.mid(9).trimmed();
+            else if (line.startsWith("HID_ID="))
+                hidId = line.mid(7).trimmed();
+        }
+        if (hidName.isEmpty())
+            hidName = readSysFile(
+                QFileInfo(hidDevPath + "/../product").canonicalFilePath());
+        if (hidName.isEmpty())
+            hidName = entry;
+
+        // ── MonsGeek proprietary protocol ────────────────────────────────
+        // VID 0x3151, vendor usage page (0xFF__) = the raw-HID config
+        // interface that accepts GET_DONGLE_STATUS / GET_BATTERY commands.
+        {
+            struct hidraw_devinfo rawInfo = {};
+            bool hasMonsGeek = canGetFeature
+                && ::ioctl(fd, HIDIOCGRAWINFO, &rawInfo) >= 0
+                && (quint16)rawInfo.vendor == 0x3151u
+                && startsWithVendorUsagePage(descBytes, descLen);
+
+            if (hasMonsGeek) {
+                quint16 pid      = (quint16)rawInfo.product;
+                bool    isDongle = (pid == 0x503Au);
+                MonsGeekBattery mb = queryMonsGeekBattery(fd, isDongle);
+                ::close(fd);
+                seenHidDevs.insert(hidDevPath);
+
+                QString deviceStatus;
+                if (mb.hasData && mb.level >= 0) {
+                    deviceStatus = QString("Battery level: %1%").arg(mb.level);
+                    if (mb.charging) deviceStatus += " (charging)";
+                } else if (mb.hasData) {
+                    deviceStatus = "Battery level: unknown";
+                } else if (isDongle) {
+                    deviceStatus = "Battery: keyboard not connected to dongle";
+                } else {
+                    deviceStatus = "Battery level: unknown";
+                }
+
+                Device d;
+                d.name         = "Battery on " + hidName;
+                d.manufacturer = "(Standard)";
+                d.status       = deviceStatus;
+                d.driver       = "usbhid";
+                d.driverVersion = kernelRelease();
+                d.rawLocation  = entry;
+                d.location     = "on " + hidName;
+                out.append(d);
+                continue;
+            }
+        }
+
+        // ── Standard HID Battery System (0x85) ───────────────────────────
+        QSet<int> battIds = hidBatteryReportIds(descBytes, descLen);
+
+        if (battIds.isEmpty()) {
+            ::close(fd);
+            continue;
+        }
+
+        // Attempt to read the battery level via feature report.
+        int level = -1;
+        if (canGetFeature) {
+            for (int rid : battIds) {
+                level = readHidFeatureBattery(fd, rid);
+                if (level >= 0) break;
+            }
+        }
+        ::close(fd);
+
+        seenHidDevs.insert(hidDevPath);
+
+        QString deviceStatus;
+        if (level >= 0)
+            deviceStatus = QString("Battery level: %1%").arg(level);
+        else if (!canGetFeature)
+            deviceStatus = "Battery detected (no read permission on " + devNode + ")";
+        else
+            deviceStatus = "Battery level: unknown";
+
+        Device d;
+        d.name = "Battery on " + hidName;
+        d.manufacturer = "(Standard)";
+        d.status = deviceStatus;
+        d.driver = "usbhid";
+        d.driverVersion = kernelRelease();
+        d.rawLocation = entry;
+        d.location = "on " + hidName;
+        out.append(d);
+    }
+    return out;
+}
+
 } // namespace
 
 QVector<DeviceCategory> scanDevices() {
@@ -2017,6 +2310,7 @@ QVector<DeviceCategory> scanDevices() {
 
     auto batteries = scanBatteries();
     batteries += scanHidBatteries();
+    batteries += scanHidrawBatteries();
     addIfAny("Batteries", "kded5", batteries);
     addIfAny("Bluetooth Radios", "network-bluetooth", scanBluetooth());
     addIfAny("Game controllers", "input-gaming",
