@@ -76,10 +76,33 @@ jobs:
           cd aur-linux-devmgmt
           VER="${{ steps.version.outputs.tag }}"
           SUM="${{ steps.sha.outputs.sum }}"
-          sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('$SUM')/" PKGBUILD
-          # Generate .SRCINFO without makepkg (not available on Ubuntu)
+          cat > PKGBUILD << EOF
+          # Maintainer: actuallyaridan <https://github.com/actuallyaridan>
+          pkgname=linux-devmgmt
+          pkgver=$VER
+          pkgrel=1
+          pkgdesc="A faithful recreation of the Windows Device Manager"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/actuallyaridan/linux-devmgmt"
+          license=('MIT')
+          depends=('qt6-base')
+          makedepends=('cmake' 'ninja')
+          source=("\$pkgname-\$pkgver.tar.gz::https://github.com/actuallyaridan/linux-devmgmt/archive/refs/tags/v\$pkgver.tar.gz")
+          sha256sums=('$SUM')
+
+          build() {
+              cmake -S "\$pkgname-\$pkgver" -B build \\
+                  -G Ninja \\
+                  -DCMAKE_BUILD_TYPE=Release \\
+                  -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build build
+          }
+
+          package() {
+              DESTDIR="\$pkgdir" cmake --install build
+              install -Dm644 "\$pkgname-\$pkgver/LICENSE" "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+          }
+          EOF
           cat > .SRCINFO << EOF
           pkgbase = linux-devmgmt
           	pkgdesc = A faithful recreation of the Windows Device Manager
