@@ -32,3 +32,4 @@ target_include_directories(devmgmt PRIVATE
 target_link_libraries(devmgmt PRIVATE Qt6::Widgets)
 
 install(TARGETS devmgmt RUNTIME DESTINATION bin)
+install(FILES linux-devmgmt.desktop DESTINATION share/applications)

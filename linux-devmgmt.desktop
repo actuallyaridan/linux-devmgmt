@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Device Manager
+Comment=View and manage hardware devices
+Exec=devmgmt
+Icon=device-notifier-symbolic
+Categories=System;HardwareSettings;
+Terminal=false
+StartupNotify=true
