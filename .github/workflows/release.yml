@@ -74,10 +74,29 @@ jobs:
       - name: Update linux-devmgmt PKGBUILD
         run: |
           cd aur-linux-devmgmt
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.tag }}/" PKGBUILD
+          VER="${{ steps.version.outputs.tag }}"
+          SUM="${{ steps.sha.outputs.sum }}"
+          sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha.outputs.sum }}')/" PKGBUILD
-          makepkg --printsrcinfo > .SRCINFO
+          sed -i "s/^sha256sums=.*/sha256sums=('$SUM')/" PKGBUILD
+          # Generate .SRCINFO without makepkg (not available on Ubuntu)
+          cat > .SRCINFO << EOF
+          pkgbase = linux-devmgmt
+          	pkgdesc = A faithful recreation of the Windows Device Manager
+          	pkgver = $VER
+          	pkgrel = 1
+          	url = https://github.com/actuallyaridan/linux-devmgmt
+          	arch = x86_64
+          	arch = aarch64
+          	license = MIT
+          	makedepends = cmake
+          	makedepends = ninja
+          	depends = qt6-base
+          	source = linux-devmgmt-$VER.tar.gz::https://github.com/actuallyaridan/linux-devmgmt/archive/refs/tags/v$VER.tar.gz
+          	sha256sums = $SUM
+
+          pkgname = linux-devmgmt
+          EOF
           git config user.name "actuallyaridan"
           git config user.email "adnan@aridan.net"
           git add PKGBUILD .SRCINFO
