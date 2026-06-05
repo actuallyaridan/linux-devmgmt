@@ -40,3 +40,55 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: devmgmt-${{ matrix.arch }}
+
+  aur:
+    name: Publish to AUR
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get version
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Compute sha256sum
+        id: sha
+        run: |
+          URL="https://github.com/actuallyaridan/linux-devmgmt/archive/refs/tags/v${{ steps.version.outputs.tag }}.tar.gz"
+          echo "sum=$(curl -sL $URL | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Checkout AUR linux-devmgmt
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur_id_ed25519
+          chmod 600 ~/.ssh/aur_id_ed25519
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_id_ed25519
+            User aur
+          EOF
+          git clone ssh://aur@aur.archlinux.org/linux-devmgmt.git aur-linux-devmgmt
+          git clone ssh://aur@aur.archlinux.org/linux-devmgmt-git.git aur-linux-devmgmt-git
+
+      - name: Update linux-devmgmt PKGBUILD
+        run: |
+          cd aur-linux-devmgmt
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.tag }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha.outputs.sum }}')/" PKGBUILD
+          makepkg --printsrcinfo > .SRCINFO
+          git config user.name "actuallyaridan"
+          git config user.email "adnan@aridan.net"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git commit -m "Update to v${{ steps.version.outputs.tag }}"
+          git push
+
+      - name: Update linux-devmgmt-git PKGBUILD
+        run: |
+          cd aur-linux-devmgmt-git
+          git config user.name "actuallyaridan"
+          git config user.email "adnan@aridan.net"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git commit -m "Update to v${{ steps.version.outputs.tag }}"
+          git push

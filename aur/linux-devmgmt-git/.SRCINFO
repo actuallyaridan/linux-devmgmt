@@ -1,0 +1,18 @@
+pkgbase = linux-devmgmt-git
+	pkgdesc = A faithful recreation of the Windows Device Manager (git)
+	pkgver = r0.unknown
+	pkgrel = 1
+	url = https://github.com/actuallyaridan/linux-devmgmt
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cmake
+	makedepends = ninja
+	makedepends = git
+	depends = qt6-base
+	provides = linux-devmgmt
+	conflicts = linux-devmgmt
+	source = linux-devmgmt-git::git+https://github.com/actuallyaridan/linux-devmgmt.git
+	sha256sums = SKIP
+
+pkgname = linux-devmgmt-git
