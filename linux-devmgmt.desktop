@@ -7,3 +7,4 @@ Icon=applications-system
 Categories=System;HardwareSettings;
 Terminal=false
 StartupNotify=true
+Keywords=devmgmt
