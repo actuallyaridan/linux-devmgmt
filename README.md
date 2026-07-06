@@ -84,3 +84,10 @@ On Arch, you need these installed separately. The Nix flake handles all of them 
 - Update Driver wizard
 - Driver Details viewer (`modinfo` output)
 - Scan for hardware changes
+
+## Part of the WSL (Windows-alike Software for Linux) series
+
+Why don't you also check out the other ones?
+
+- Linux Device Manager
+- [Linux Control Panel](https://github.com/actuallyaridan/linux-control)
