@@ -221,6 +221,7 @@ QVariant DeviceModel::deviceField(const QModelIndex &index,
     if (field == "sysfsPciPath") return d.sysfsPciPath;
     if (field == "btAddress") return d.btAddress;
     if (field == "noDriverNeeded") return d.noDriverNeeded;
+    if (field == "airpodsBattery") return d.airpodsBattery;
     if (field == "deviceType") {
         if (n->parent && (n->parent->type == CategoryNode
                           || n->parent->type == DisabledCategoryNode))

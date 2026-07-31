@@ -309,7 +309,7 @@ void MainWindow::buildMenus() {
         auto *nameLabel = new QLabel("Device Manager");
 
         auto *companyLabel = new QLabel("@actuallyaridan");
-        auto *versionLabel = new QLabel("Version: 2.0.4");
+        auto *versionLabel = new QLabel("Version: 2.1");
 
         auto *infoLayout = new QVBoxLayout;
         infoLayout->addWidget(nameLabel);
@@ -485,7 +485,8 @@ void MainWindow::showProperties() {
         m_model->deviceField(idx, "sysfsPciPath").toString(),
         m_model->deviceField(idx, "deviceType").toString(),
         m_model->deviceField(idx, "btAddress").toString(),
-        m_model->deviceField(idx, "noDriverNeeded").toBool()
+        m_model->deviceField(idx, "noDriverNeeded").toBool(),
+        m_model->deviceField(idx, "airpodsBattery").toBool()
     };
     DevicePropertiesDialog dlg(info, this);
     connect(&dlg, &DevicePropertiesDialog::disableToggled,

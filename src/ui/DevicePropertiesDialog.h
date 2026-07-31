@@ -22,6 +22,7 @@ struct DeviceInfo {
     QString deviceType;
     QString btAddress;
     bool noDriverNeeded = false;
+    bool airpodsBattery = false;
 };
 
 class DevicePropertiesDialog : public QDialog {

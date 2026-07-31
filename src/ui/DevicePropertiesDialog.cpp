@@ -4,6 +4,7 @@
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
 #include "IconHelper.h"
+#include "AirPodsScanner.h"
 
 #include <QCoreApplication>
 #include <QStandardPaths>
@@ -89,6 +90,30 @@ void launchUsbmuxd() {
             }
         });
     }
+}
+
+QString describeAirPodsBattery(const AirPodsBattery &b) {
+    auto line = [](const char *label, int level, bool charging) {
+        if (level < 0)
+            return QString();
+        QString s = QString(label) + ": " + QString::number(level) + "%";
+        if (charging)
+            s += " (charging)";
+        return s + "\n";
+    };
+
+    QString out = line("Left", b.left, b.leftCharging)
+                + line("Right", b.right, b.rightCharging)
+                + line("Case", b.caseLevel, b.caseCharging);
+
+    if (b.left < 0 || b.right < 0 || b.caseLevel < 0)
+        out += "\nAnything not listed is not reporting: a pod stops while it "
+               "sits in the case, and the case stops while its lid is shut.\n";
+
+    // The broadcast carries one value per component in steps of ten, so a pod
+    // Apple's own software shows as 83% is broadcast as 80%.
+    out += "\nLevels are broadcast in steps of ten, so they are approximate.";
+    return out;
 }
 
 } // namespace
@@ -232,6 +257,11 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
     else if (m_info.status == "No driver loaded")
         statusText = "The drivers for this device are not installed. "
                      "(Code 28)";
+    else if (m_info.airpodsBattery && m_info.status == "No battery level")
+        statusText = "This device is working properly.\n\n"
+                     "This device broadcasts its battery level rather than "
+                     "reporting it over the connection, so the level has to be "
+                     "requested.";
     else if (m_info.status == "No battery level")
         statusText = "This device is working properly.\n\nNo reported battery level.";
     else if (m_info.status.startsWith("Battery level: "))
@@ -360,6 +390,49 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
         } else {
             gbLayout->setContentsMargins(8, 3, 8, 32);
         }
+    } else if (m_info.airpodsBattery) {
+        gbLayout->setContentsMargins(8, 3, 8, 8);
+
+        auto *podsSection = new QWidget;
+        auto *sectionLayout = new QVBoxLayout(podsSection);
+        sectionLayout->setContentsMargins(0, 4, 0, 0);
+        sectionLayout->setSpacing(6);
+
+        auto *infoLabel = new QLabel(
+            "Reading the level needs a brief Bluetooth scan, which shares the "
+            "radio with audio. Playback may stutter or drop out while it runs, "
+            "and is more likely to on older adapters.");
+        infoLabel->setWordWrap(true);
+        sectionLayout->addWidget(infoLabel);
+
+        auto *readBtn = new QPushButton("Request battery level");
+        sectionLayout->addWidget(readBtn, 0, Qt::AlignLeft);
+
+        gbLayout->addWidget(podsSection);
+
+        connect(readBtn, &QPushButton::clicked, this, [this, statusBox, readBtn] {
+            readBtn->setEnabled(false);
+            readBtn->setText("Listening...");
+            // Repaint the button before the scan takes over the radio, so the
+            // window does not sit there looking unresponsive.
+            QCoreApplication::processEvents();
+
+            const AirPodsBattery battery = requestAirPodsBattery(m_info.btAddress);
+
+            readBtn->setEnabled(true);
+            readBtn->setText("Request battery level");
+
+            if (battery.isEmpty()) {
+                statusBox->setPlainText(
+                    "This device is working properly.\n\n"
+                    "No battery level was heard. A headset sitting in a closed "
+                    "case stops broadcasting — take it out, or open the lid, "
+                    "and try again.");
+                return;
+            }
+            statusBox->setPlainText("This device is working properly.\n\n"
+                                    + describeAirPodsBattery(battery));
+        });
     } else {
         gbLayout->setContentsMargins(8, 3, 8, 32);
     }

@@ -1,4 +1,5 @@
 #include "SysfsScanner.h"
+#include "AirPodsScanner.h"
 #include "DeviceUtils.h"
 #include "DeviceOps.h"
 #include "KnownDriverDates.h"
@@ -15,10 +16,7 @@
 #include <QProcess>
 #include <QRegularExpression>
 
-#include <fcntl.h>
-#include <linux/hidraw.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include <optional>
 
 namespace {
 
@@ -453,7 +451,12 @@ QString friendlyLocation(const QString &sysfsPath,
     if (path.contains("i8042") || path.contains("serio"))
         return "plugged in to PS/2 mouse port";
 
-    if (path.contains("/bluetooth/"))
+    // Classic Bluetooth devices sit under /bluetooth/, but BLE peripherals are
+    // attached by BlueZ through uhid, so their path carries neither /bluetooth/
+    // nor any bus topology. The HID bus id in the path (0005 = BUS_BLUETOOTH)
+    // is what identifies those.
+    static QRegularExpression btBusRe(R"(/0005:[0-9A-Fa-f]{4}:)");
+    if (path.contains("/bluetooth/") || btBusRe.match(path).hasMatch())
         return "connected via Bluetooth";
 
     if (path.contains("/usb")) {
@@ -802,6 +805,116 @@ QHash<QString, iOSBatteryInfo> scaniOSBatteries() {
     return result;
 }
 
+// One battery-bearing device as UPower reports it. Enumerated once per scan and
+// shared by the two scanners that care: scanBatteries() uses it to fill in the
+// kernel-backed rows it already emits, and scanUPowerBatteries() lists whatever
+// is left over.
+struct UPowerDevice {
+    QString objectPath;
+    QString model;
+    QString state;
+    QString iconName;
+    QString nativePath;   // sysfs path, or /org/bluez/... for BlueZ peripherals
+    QString serial;
+    int     percentage    = -1;
+    bool    isPowerSupply = false;
+    bool    present       = true;
+
+    // Not every backend fills in state: the phone one reports no such line and
+    // leaves the icon as the only place charging shows up.
+    bool charging() const {
+        return state.isEmpty() ? iconName.contains("charging")
+                               : state == QLatin1String("charging");
+    }
+};
+
+QVector<UPowerDevice> scanUPowerDevices() {
+    QVector<UPowerDevice> out;
+
+    QProcess enumerate;
+    enumerate.start("upower", {"-e"});
+    if (!enumerate.waitForFinished(4000) || enumerate.exitCode() != 0)
+        return out;
+
+    for (const QString &line :
+         QString::fromUtf8(enumerate.readAllStandardOutput()).split('\n')) {
+        const QString objectPath = line.trimmed();
+        // DisplayDevice is an aggregate of the others, not a real peripheral.
+        if (objectPath.isEmpty() || objectPath.endsWith("/DisplayDevice"))
+            continue;
+
+        QProcess info;
+        info.start("upower", {"-i", objectPath});
+        if (!info.waitForFinished(4000) || info.exitCode() != 0)
+            continue;
+
+        UPowerDevice d;
+        d.objectPath = objectPath;
+
+        for (const QString &raw :
+             QString::fromUtf8(info.readAllStandardOutput()).split('\n')) {
+            const QString t = raw.trimmed();
+            // The first colon is always the key separator; values may contain
+            // their own colons (a MAC address, for instance).
+            auto value = [&t] { return t.mid(t.indexOf(':') + 1).trimmed(); };
+
+            if (t.startsWith("model:"))
+                d.model = value();
+            else if (t.startsWith("native-path:"))
+                d.nativePath = value();
+            else if (t.startsWith("serial:"))
+                d.serial = value();
+            else if (t.startsWith("power supply:"))
+                d.isPowerSupply = (value() == "yes");
+            else if (t.startsWith("state:"))
+                d.state = value();
+            else if (t.startsWith("icon-name:"))
+                d.iconName = value();
+            else if (t.startsWith("present:"))
+                d.present = (value() != "no");
+            else if (t.startsWith("percentage:")) {
+                bool ok = false;
+                int v = value().remove('%').toInt(&ok);
+                if (ok) d.percentage = v;
+            }
+        }
+        out.append(d);
+    }
+    return out;
+}
+
+// Finds UPower's view of a device, if it has one. What lands in native-path
+// depends on which backend produced the device, so both forms are matched:
+//
+//   kernel power_supply  the bare node name, "ps-controller-battery-d4:2f:…"
+//   phone (libimobile.)  an absolute sysfs path, "/sys/devices/…/usb1/1-3"
+//   BlueZ                a D-Bus path, "/org/bluez/…" — never matches here
+//
+// sysfsPath is the device that owns the battery; powerSupplyEntry is the
+// /sys/class/power_supply node name, empty for callers that have no such node.
+const UPowerDevice *findUPowerDevice(const QVector<UPowerDevice> &devices,
+                                     const QString &sysfsPath,
+                                     const QString &powerSupplyEntry = {}) {
+    const QString target = sysfsPath.isEmpty()
+        ? QString()
+        : QFileInfo(sysfsPath).canonicalFilePath();
+
+    for (const UPowerDevice &d : devices) {
+        if (d.nativePath.isEmpty())
+            continue;
+        if (!powerSupplyEntry.isEmpty() && d.nativePath == powerSupplyEntry)
+            return &d;
+        if (target.isEmpty() || !d.nativePath.startsWith('/')
+                || d.nativePath.startsWith("/org/"))
+            continue;
+        // Canonicalised on both sides, since sysfs hands out symlinked paths.
+        const QString candidate = QFileInfo(d.nativePath).canonicalFilePath();
+        if (!candidate.isEmpty() && candidate == target)
+            return &d;
+    }
+    return nullptr;
+}
+
 bool isPortableUsbDevice(const QString &entry, const QString &canonPath) {
     // Devices with a Still Image (MTP/PTP) interface — class 06
     QDir base("/sys/bus/usb/devices");
@@ -829,7 +942,8 @@ bool isPortableUsbDevice(const QString &entry, const QString &canonPath) {
     return false;
 }
 
-QVector<Device> scanPortableDevices(QSet<QString> *usedEntries) {
+QVector<Device> scanPortableDevices(const QVector<UPowerDevice> &upower,
+                                    QSet<QString> *usedEntries) {
     QVector<Device> out;
     QDir base("/sys/bus/usb/devices");
     if (!base.exists())
@@ -851,8 +965,13 @@ QVector<Device> scanPortableDevices(QSet<QString> *usedEntries) {
         if (product.isEmpty())
             continue;
 
+        // The USB descriptor only carries the model ("iPhone"). UPower knows the
+        // name the user gave the device ("Adnan – iPhone"), which is what tells
+        // two of the same model apart, so prefer it when it is available.
+        const UPowerDevice *up = findUPowerDevice(upower, path);
+
         Device d;
-        d.name = product;
+        d.name = (up && !up->model.isEmpty()) ? up->model : product;
         d.manufacturer = mfr.isEmpty() ? "(Standard portable device)" : mfr;
         d.status = "Working properly";
         d.driver = QFileInfo(
@@ -864,6 +983,8 @@ QVector<Device> scanPortableDevices(QSet<QString> *usedEntries) {
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
         d.location = friendlyLocation(path, entry);
+        // Keyed on the USB product, not the display name — a user-set name like
+        // "Adnan's brick" says nothing about which icon to draw.
         QString productLower = product.toLower();
         if (productLower.contains("ipad"))
             d.iconName = "computer-apple-ipad";
@@ -1179,7 +1300,11 @@ QVector<Device> scanHidGeneric() {
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
-        d.location = friendlyLocation(path, entry);
+        // A Bluetooth HID interface belongs to the peripheral itself, which is
+        // the thing that connects to the machine — so name the parent here
+        // rather than repeating "connected via Bluetooth" at every level.
+        d.location = hidId.left(4) == "0005" ? "on " + hidName
+                                             : friendlyLocation(path, entry);
         out.append(d);
     }
     return out;
@@ -1526,12 +1651,22 @@ QVector<Device> scanSoundCards() {
     return out;
 }
 
-QVector<Device> scanBatteries() {
+// Object paths inserted into consumedUPower are already represented by a row
+// this function returned, and scanUPowerBatteries() must not emit them again.
+QVector<Device> scanBatteries(const QVector<UPowerDevice> &upower,
+                              QSet<QString> *consumedUPower) {
     QVector<Device> out;
     QDir base("/sys/class/power_supply");
     if (!base.exists())
         return out;
-    const QHash<QString, iOSBatteryInfo> iosBatteries = scaniOSBatteries();
+    // ideviceinfo opens a lockdown session per device, so it is only run if
+    // UPower could not supply the level — see the apple_mfi branch below.
+    std::optional<QHash<QString, iOSBatteryInfo>> iosBatteryCache;
+    auto iosBatteries = [&]() -> const QHash<QString, iOSBatteryInfo> & {
+        if (!iosBatteryCache)
+            iosBatteryCache = scaniOSBatteries();
+        return *iosBatteryCache;
+    };
     QString hostModel = dmiProductName();
     for (const QString &entry : base.entryList(
              QDir::AllEntries | QDir::NoDotAndDotDot)) {
@@ -1547,32 +1682,70 @@ QVector<Device> scanBatteries() {
         QString mfr = readSysFile(path + "/manufacturer");
         Device d;
 
+        // Walk up two levels: power_supply/<entry> → power_supply/ → the device
+        // that owns the node.
+        QDir ownerDir(canonicalPath);
+        ownerDir.cdUp();
+        ownerDir.cdUp();
+        const QString ownerPath = ownerDir.absolutePath();
+
+        // Every branch below emits exactly one row, so if UPower also knows this
+        // battery, claim it here — scanUPowerBatteries() must not list it again.
+        // The claim is made for all of them, not just the phone: any battery the
+        // kernel exposes with scope=Device is reported by UPower as "power
+        // supply: no" and so slips past the flag test over there.
+        const UPowerDevice *up = findUPowerDevice(upower, ownerPath, entry);
+        if (up && consumedUPower)
+            consumedUPower->insert(up->objectPath);
+
+        // A level from UPower, for the branches whose sysfs node has none.
+        auto upowerLevel = [&up]() -> QString {
+            if (!up || !up->present || up->percentage < 0)
+                return {};
+            QString s = QString("Battery level: %1%").arg(up->percentage);
+            if (up->charging())
+                s += " (charging)";
+            return s;
+        };
+
         if (entry.startsWith("apple_mfi_fastcharge_")) {
-            // Walk up two levels: power_supply/<entry> → power_supply/ → USB device dir
-            QDir dir(canonicalPath);
-            dir.cdUp();
-            dir.cdUp();
-            QString usbProduct = readSysFile(dir.absolutePath() + "/product").trimmed();
-            QString usbMfr = readSysFile(dir.absolutePath() + "/manufacturer").trimmed();
+            const QString usbPath = ownerPath;
+            QString usbProduct = readSysFile(usbPath + "/product").trimmed();
+            QString usbMfr = readSysFile(usbPath + "/manufacturer").trimmed();
             if (usbProduct.isEmpty())
                 usbProduct = "Apple Device";
-            d.name = "Battery on " + usbProduct;
-            d.location = "on " + usbProduct;
+
+            // This node only controls fast charging — it exposes no capacity of
+            // its own, so the level has to come from libimobiledevice either
+            // way. UPower reads it through the library and caches the result,
+            // while ideviceinfo spawns a fresh lockdown session per scan, so
+            // UPower goes first and the tools are the fallback. UPower also
+            // knows the user-set device name, which beats the generic USB
+            // product string ("Adnan – iPhone" rather than "iPhone").
+            const QString displayName =
+                (up && !up->model.isEmpty()) ? up->model : usbProduct;
+            d.name = "Battery on " + displayName;
+            d.location = "on " + displayName;
             d.manufacturer = usbMfr.isEmpty() ? "Apple Inc." : usbMfr;
-            // Read battery level via libimobiledevice if the device is trusted.
             d.status = "No battery level";
-            if (!iosBatteries.isEmpty()) {
-                const QString usbSerial = readSysFile(
-                    dir.absolutePath() + "/serial").trimmed();
-                if (!usbSerial.isEmpty() && iosBatteries.contains(usbSerial)) {
-                    const iOSBatteryInfo &batt = iosBatteries.value(usbSerial);
-                    if (batt.capacity >= 0) {
-                        d.status = QString("Battery level: %1%").arg(batt.capacity);
-                        if (batt.charging)
-                            d.status += " (charging)";
+
+            if (const QString level = upowerLevel(); !level.isEmpty()) {
+                d.status = level;
+            } else {
+                const QString usbSerial = readSysFile(usbPath + "/serial").trimmed();
+                if (!usbSerial.isEmpty()) {
+                    const QHash<QString, iOSBatteryInfo> &batteries = iosBatteries();
+                    if (batteries.contains(usbSerial)) {
+                        const iOSBatteryInfo &batt = batteries.value(usbSerial);
+                        if (batt.capacity >= 0) {
+                            d.status = QString("Battery level: %1%").arg(batt.capacity);
+                            if (batt.charging)
+                                d.status += " (charging)";
+                        }
                     }
                 }
             }
+
             d.driver = "apple-mfi-fastcharge";
             DriverInfo di = moduleDriverInfo(d.driver);
             d.driverVersion = di.version;
@@ -1609,13 +1782,19 @@ QVector<Device> scanBatteries() {
             else if (!capacityLevel.isEmpty() && capacityLevel != "Unknown")
                 d.status = QString("Battery level: %1").arg(capacityLevel);
             else
+                d.status = upowerLevel();
+            if (d.status.isEmpty())
                 d.status = "Working properly";
         } else {
             d.name = model.isEmpty() ? entry : model;
             d.location = hostModel.isEmpty()
                 ? friendlyLocation(canonicalPath, entry)
                 : "on " + hostModel;
-            d.status = "Working properly";
+            // This branch never reads a level of its own, so without UPower's
+            // the claim above would have silently thrown one away.
+            d.status = upowerLevel();
+            if (d.status.isEmpty())
+                d.status = "Working properly";
         }
 
         d.manufacturer = mfr.isEmpty() ? "(Standard)" : mfr;
@@ -2009,289 +2188,82 @@ QVector<Device> scanUnknownUsbDevices() {
     return out;
 }
 
-// Returns true if the first Usage Page declared in a HID report descriptor
-// is vendor-specific (0xFF00–0xFFFF). Used to identify MonsGeek raw-HID
-// config interfaces that accept battery query commands.
-static bool startsWithVendorUsagePage(const quint8 *desc, int len) {
-    for (int i = 0; i < len; ) {
-        quint8 item = desc[i];
-        if (item == 0xFE) { if (i + 2 >= len) break; i += 3 + desc[i + 1]; continue; }
-        int sz = item & 3, btype = (item >> 2) & 3, btag = (item >> 4) & 0xF;
-        int nb = (sz == 3) ? 4 : sz;
-        if (i + 1 + nb > len) break;
-        quint32 v = 0;
-        for (int b = 0; b < nb; ++b) v |= (quint32)desc[i + 1 + b] << (8 * b);
-        i += 1 + nb;
-        if (btype == 1 && btag == 0) // first Usage Page
-            return (v >> 8) == 0xFF;
-    }
-    return false;
-}
-
-struct MonsGeekBattery { int level = -1; bool charging = false; bool hasData = false; };
-
-// Queries battery level from a MonsGeek keyboard via the proprietary
-// GET_DONGLE_STATUS (0xF7) or GET_BATTERY (0x83) feature report command.
-// Protocol: HIDIOCSFEATURE sends the command; HIDIOCGFEATURE reads the response.
-// Response layout (buf[0] = echoed report ID 0x00):
-//   Wireless (0xF7): buf[2]=has_response, buf[3]=battery%, buf[5]=charging
-//   Wired    (0x83): buf[1]=0x83 echo,   buf[2]=0xAA ok,   buf[3]=battery%
-static MonsGeekBattery queryMonsGeekBattery(int fd, bool isDongle) {
-    MonsGeekBattery r;
-    quint8 cmd   = isDongle ? 0xF7u : 0x83u;
-    quint8 cksum = (quint8)(255u - cmd);
-
-    quint8 sbuf[65] = {};
-    // sbuf[0] = 0x00 (report ID, already zero)
-    sbuf[1] = cmd;
-    sbuf[7] = cksum;
-    if (::ioctl(fd, HIDIOCSFEATURE(sizeof(sbuf)), sbuf) < 0)
-        return r;
-
-    quint8 gbuf[65] = {};
-    if (::ioctl(fd, HIDIOCGFEATURE(sizeof(gbuf)), gbuf) < 0)
-        return r;
-
-    if (isDongle) {
-        if (gbuf[2] == 0) return r;   // has_response=0: keyboard not seen by dongle yet
-        r.hasData  = true;
-        r.level    = (int)gbuf[3];
-        r.charging = (gbuf[5] != 0);
-    } else {
-        if (gbuf[2] != 0xAA) return r; // 0xAA = success marker
-        r.hasData = true;
-        r.level   = (int)gbuf[3];
-    }
-    return r;
-}
-
-// Minimal HID report descriptor parser: returns the set of report IDs that
-// contain an "Absolute State of Charge" (usage 0x35 in Battery System page
-// 0x85) or "Remaining Capacity" (usage 0x44 in Power Device page 0x84)
-// inside a Feature collection.
-static QSet<int> hidBatteryReportIds(const quint8 *desc, int len) {
-    QSet<int> result;
-    int usagePage = 0, reportId = 0;
-    bool hasBattUsage = false;
-
-    for (int i = 0; i < len; ) {
-        quint8 item = desc[i];
-        if (item == 0xFE) {                     // long item
-            if (i + 2 >= len) break;
-            i += 3 + (int)(quint8)desc[i + 1];
-            continue;
-        }
-        int sz    = item & 0x03;
-        int btype = (item >> 2) & 0x03;
-        int btag  = (item >> 4) & 0x0F;
-        int nb    = (sz == 3) ? 4 : sz;
-        if (i + 1 + nb > len) break;
-
-        quint32 v = 0;
-        for (int b = 0; b < nb; ++b)
-            v |= (quint32)(quint8)desc[i + 1 + b] << (8 * b);
-        i += 1 + nb;
-
-        switch (btype) {
-        case 1: // Global
-            if (btag == 0) usagePage = (int)v;  // Usage Page
-            if (btag == 8) reportId  = (int)v;  // Report ID
-            break;
-        case 2: // Local
-            if (btag == 0 && ((usagePage == 0x85 && v == 0x35) ||   // Abs SoC
-                              (usagePage == 0x84 && v == 0x44)))     // Remaining Cap
-                hasBattUsage = true;
-            break;
-        case 0: // Main
-            if (btag == 0xB && hasBattUsage)    // Feature
-                result.insert(reportId);
-            hasBattUsage = false;               // Local state resets after any Main item
-            break;
-        }
-    }
-    return result;
-}
-
-// Sends HIDIOCGFEATURE for the given report ID, returns 0-100 on success, -1
-// if the report can't be read or doesn't contain a valid percentage.
-static int readHidFeatureBattery(int fd, int reportId) {
-    quint8 buf[65] = {};
-    buf[0] = (quint8)reportId;
-    int ret = ::ioctl(fd, HIDIOCGFEATURE(sizeof(buf)), buf);
-    if (ret < 0)
-        return -1;
-    // buf[0] is the echoed report ID; data starts at buf[1].
-    // The Absolute State of Charge is 0-100%; scan the first 8 data bytes.
-    for (int b = 1; b < ret && b <= 8; ++b) {
-        if (buf[b] <= 100)
-            return (int)buf[b];
-    }
-    return -1;
-}
-
-// Scans /sys/class/hidraw for HID devices that advertise a Battery System
-// feature report in their report descriptor but have no kernel power_supply
-// entry (e.g. some 2.4 GHz wireless keyboards whose battery the kernel doesn't
-// surface via the standard power_supply class).
-QVector<Device> scanHidrawBatteries() {
+// Bluetooth peripherals report charge via the BLE Battery Service (UUID 0x180F).
+// BlueZ surfaces that through UPower only — no /sys/class/power_supply entry is
+// created — so scanBatteries() never sees them. Query UPower for the rest.
+//
+// Devices UPower marks as "power supply: yes" are kernel-backed and already
+// covered by scanBatteries(); they are skipped here to avoid duplicates.
+//
+// That flag alone is not enough, though: it answers "does this power the host?",
+// not "is this kernel-backed". A phone answers no while apple-mfi-fastcharge
+// still gives it a power_supply node that scanBatteries() has already turned
+// into a row. Those are matched by native-path over there and arrive here in
+// consumed.
+QVector<Device> scanUPowerBatteries(const QVector<UPowerDevice> &upower,
+                                    const QSet<QString> &consumed) {
     QVector<Device> out;
 
-    // Collect canonical sysfs paths of HID devices already covered by a
-    // kernel power_supply entry so we don't create duplicate entries.
-    QSet<QString> coveredHidPaths;
-    {
-        QDir ps("/sys/class/power_supply");
-        for (const QString &e : ps.entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
-            QString canon = QFileInfo(ps.absoluteFilePath(e)).canonicalFilePath();
-            if (readSysFile(canon + "/type") == QLatin1String("Battery"))
-                coveredHidPaths.insert(canon);
-        }
-    }
-
-    QDir hidrawDir("/sys/class/hidraw");
-    if (!hidrawDir.exists())
-        return out;
-
-    QSet<QString> seenHidDevs;
-
-    for (const QString &entry : hidrawDir.entryList(
-             QDir::AllEntries | QDir::NoDotAndDotDot)) {
-        // Resolve the HID device that backs this hidraw node.
-        QString hidDevPath = QFileInfo(
-            hidrawDir.absoluteFilePath(entry) + "/device"
-        ).canonicalFilePath();
-        if (hidDevPath.isEmpty() || seenHidDevs.contains(hidDevPath))
+    for (const UPowerDevice &u : upower) {
+        if (u.isPowerSupply || !u.present || u.percentage < 0 || u.model.isEmpty())
+            continue;
+        if (consumed.contains(u.objectPath))
             continue;
 
-        // Skip if a power_supply entry already covers this HID device.
-        bool covered = false;
-        for (const QString &cp : coveredHidPaths) {
-            if (cp.startsWith(hidDevPath + '/')) { covered = true; break; }
-        }
-        if (covered)
-            continue;
-
-        QString devNode = "/dev/" + entry;
-
-        // O_RDWR is required for HIDIOCGFEATURE; fall back to O_RDONLY for
-        // descriptor-only detection when the user only has read permission.
-        int fd = ::open(devNode.toLocal8Bit().constData(), O_RDWR | O_NONBLOCK);
-        bool canGetFeature = (fd >= 0);
-        if (fd < 0)
-            fd = ::open(devNode.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK);
-        if (fd < 0)
-            continue;
-
-        // Read the HID report descriptor.
-        int descSize = 0;
-        struct hidraw_report_descriptor rptDesc = {};
-        bool gotDesc = (::ioctl(fd, HIDIOCGRDESCSIZE, &descSize) >= 0
-                        && descSize > 0);
-        if (gotDesc) {
-            rptDesc.size = (unsigned int)descSize;
-            gotDesc = (::ioctl(fd, HIDIOCGRDESC, &rptDesc) >= 0);
-        }
-
-        if (!gotDesc) {
-            ::close(fd);
-            continue;
-        }
-
-        const quint8 *descBytes = reinterpret_cast<const quint8 *>(rptDesc.value);
-        int           descLen   = (int)rptDesc.size;
-
-        // Resolve a human-readable name from the HID device's sysfs uevent.
-        QString hidName, hidId;
-        for (const QString &line : readSysFile(hidDevPath + "/uevent").split('\n')) {
-            if (line.startsWith("HID_NAME="))
-                hidName = line.mid(9).trimmed();
-            else if (line.startsWith("HID_ID="))
-                hidId = line.mid(7).trimmed();
-        }
-        if (hidName.isEmpty())
-            hidName = readSysFile(
-                QFileInfo(hidDevPath + "/../product").canonicalFilePath());
-        if (hidName.isEmpty())
-            hidName = entry;
-
-        // ── MonsGeek proprietary protocol ────────────────────────────────
-        // VID 0x3151, vendor usage page (0xFF__) = the raw-HID config
-        // interface that accepts GET_DONGLE_STATUS / GET_BATTERY commands.
-        {
-            struct hidraw_devinfo rawInfo = {};
-            bool hasMonsGeek = canGetFeature
-                && ::ioctl(fd, HIDIOCGRAWINFO, &rawInfo) >= 0
-                && (quint16)rawInfo.vendor == 0x3151u
-                && startsWithVendorUsagePage(descBytes, descLen);
-
-            if (hasMonsGeek) {
-                quint16 pid      = (quint16)rawInfo.product;
-                bool    isDongle = (pid == 0x503Au);
-                MonsGeekBattery mb = queryMonsGeekBattery(fd, isDongle);
-                ::close(fd);
-                seenHidDevs.insert(hidDevPath);
-
-                QString deviceStatus;
-                if (mb.hasData && mb.level >= 0) {
-                    deviceStatus = QString("Battery level: %1%").arg(mb.level);
-                    if (mb.charging) deviceStatus += " (charging)";
-                } else if (mb.hasData) {
-                    deviceStatus = "Battery level: unknown";
-                } else if (isDongle) {
-                    deviceStatus = "Battery: keyboard not connected to dongle";
-                } else {
-                    deviceStatus = "Battery level: unknown";
-                }
-
-                Device d;
-                d.name         = "Battery on " + hidName;
-                d.manufacturer = "(Standard)";
-                d.status       = deviceStatus;
-                d.driver       = "usbhid";
-                d.driverVersion = kernelRelease();
-                d.rawLocation  = entry;
-                d.location     = "on " + hidName;
-                out.append(d);
-                continue;
-            }
-        }
-
-        // ── Standard HID Battery System (0x85) ───────────────────────────
-        QSet<int> battIds = hidBatteryReportIds(descBytes, descLen);
-
-        if (battIds.isEmpty()) {
-            ::close(fd);
-            continue;
-        }
-
-        // Attempt to read the battery level via feature report.
-        int level = -1;
-        if (canGetFeature) {
-            for (int rid : battIds) {
-                level = readHidFeatureBattery(fd, rid);
-                if (level >= 0) break;
-            }
-        }
-        ::close(fd);
-
-        seenHidDevs.insert(hidDevPath);
-
-        QString deviceStatus;
-        if (level >= 0)
-            deviceStatus = QString("Battery level: %1%").arg(level);
-        else if (!canGetFeature)
-            deviceStatus = "Battery detected (no read permission on " + devNode + ")";
-        else
-            deviceStatus = "Battery level: unknown";
+        QString deviceStatus = QString("Battery level: %1%").arg(u.percentage);
+        if (u.charging())
+            deviceStatus += " (charging)";
 
         Device d;
-        d.name = "Battery on " + hidName;
+        d.name         = "Battery on " + u.model;
         d.manufacturer = "(Standard)";
-        d.status = deviceStatus;
-        d.driver = "usbhid";
-        d.driverVersion = kernelRelease();
-        d.rawLocation = entry;
-        d.location = "on " + hidName;
+        d.status       = deviceStatus;
+
+        if (u.nativePath.startsWith("/org/bluez/")) {
+            d.driver = "btusb";
+            DriverInfo di = moduleDriverInfo(d.driver);
+            d.driverVersion = di.version;
+            d.driverAuthor  = di.author;
+            d.driverDate    = di.date;
+            d.isDkms        = di.isDkms;
+            d.btAddress   = u.serial;
+            d.rawLocation = u.serial.isEmpty() ? u.objectPath : u.serial;
+            // The battery lives in the peripheral, not on the Bluetooth link —
+            // it is the peripheral that is "connected via Bluetooth".
+            d.location    = "on " + u.model;
+        } else {
+            d.driverVersion = kernelRelease();
+            d.rawLocation   = u.objectPath;
+            d.location      = "on " + u.model;
+        }
+        out.append(d);
+    }
+    return out;
+}
+
+// AirPods keep their battery levels out of every standard channel and put them
+// in a vendor advertisement instead, so reading them costs an LE scan that
+// shares the radio with audio playback (see AirPodsScanner.h). That is too
+// disruptive to do on every refresh, so the scan is left to the user: this
+// lists the headsets, and the properties dialog offers a button to read the
+// levels on demand.
+QVector<Device> scanAirPodsPlaceholders() {
+    QVector<Device> out;
+    for (const AirPodsDevice &pods : connectedAirPods()) {
+        Device d;
+        d.name         = "Battery on " + pods.name;
+        d.manufacturer = btCompanyName("004c");
+        d.status       = "No battery level";
+        d.driver       = "btusb";
+        DriverInfo di = moduleDriverInfo(d.driver);
+        d.driverVersion = di.version;
+        d.driverAuthor  = di.author;
+        d.driverDate    = di.date;
+        d.isDkms        = di.isDkms;
+        d.btAddress     = pods.address;
+        d.rawLocation   = pods.address;
+        d.location      = "on " + pods.name;
+        d.airpodsBattery = true;
         out.append(d);
     }
     return out;
@@ -2308,9 +2280,15 @@ QVector<DeviceCategory> scanDevices() {
             cats.append({name, icon, devs});
     };
 
-    auto batteries = scanBatteries();
+    // Enumerated once and shared: scanBatteries() claims the entries that match
+    // a device it already lists, scanUPowerBatteries() takes the remainder.
+    const QVector<UPowerDevice> upowerDevices = scanUPowerDevices();
+    QSet<QString> claimedUPower;
+
+    auto batteries = scanBatteries(upowerDevices, &claimedUPower);
     batteries += scanHidBatteries();
-    batteries += scanHidrawBatteries();
+    batteries += scanUPowerBatteries(upowerDevices, claimedUPower);
+    batteries += scanAirPodsPlaceholders();
     addIfAny("Batteries", "kded5", batteries);
     addIfAny("Bluetooth Radios", "network-bluetooth", scanBluetooth());
     addIfAny("Game controllers", "input-gaming",
@@ -2327,7 +2305,7 @@ QVector<DeviceCategory> scanDevices() {
     addIfAny("Network adapters", "network-card", scanNetwork());
     QSet<QString> portableEntries;
     addIfAny("Portable Devices", "smartphone",
-             scanPortableDevices(&portableEntries));
+             scanPortableDevices(upowerDevices, &portableEntries));
     addIfAny("Processors", "cpu", scanCpus());
     addIfAny("Security Devices", "drive-harddisk-encrypted", scanTpm());
     auto soundDevs = scanSoundCards();

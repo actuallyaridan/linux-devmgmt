@@ -84,6 +84,7 @@ On Arch, you need these installed separately. The Nix flake handles all of them 
 - Update Driver wizard
 - Driver Details viewer (`modinfo` output)
 - Scan for hardware changes
+- Battery levels for AirPods (per pod and case), read on request
 
 ## Part of the WSL (Windows-alike Software for Linux) series
 

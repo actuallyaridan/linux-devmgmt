@@ -7,13 +7,14 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets DBus)
 
 add_executable(devmgmt
     src/main.cpp
     src/model/DeviceModel.cpp
     src/model/DeviceOps.cpp
     src/scanner/SysfsScanner.cpp
+    src/scanner/AirPodsScanner.cpp
     src/scanner/DeviceScanner.cpp
     src/monitor/UdevMonitor.cpp
     src/ui/MainWindow.cpp
@@ -29,8 +30,7 @@ target_include_directories(devmgmt PRIVATE
     src/ui
 )
 
-target_link_libraries(devmgmt PRIVATE Qt6::Widgets)
+target_link_libraries(devmgmt PRIVATE Qt6::Widgets Qt6::DBus)
 
 install(TARGETS devmgmt RUNTIME DESTINATION bin)
 install(FILES linux-devmgmt.desktop DESTINATION share/applications)
-install(FILES udev/60-linux-devmgmt.rules DESTINATION lib/udev/rules.d)
