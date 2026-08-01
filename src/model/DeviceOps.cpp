@@ -42,13 +42,17 @@ bool setModuleBlacklisted(const QString &driver, bool blacklist, QWidget *parent
         const QString target = QString("blacklist %1").arg(driver);
         QByteArray newContent;
         QFile confFile(kModprobeConf);
-        if (confFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&confFile);
-            while (!in.atEnd()) {
-                QString line = in.readLine();
-                if (line.trimmed() != target)
-                    newContent.append((line + '\n').toUtf8());
-            }
+        if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QMessageBox::warning(parent,
+                QString("Could not %1 device").arg(opName),
+                "Could not read the blacklist file.");
+            return false;
+        }
+        QTextStream in(&confFile);
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            if (line.trimmed() != target)
+                newContent.append((line + '\n').toUtf8());
         }
         fileProc.start("pkexec", {"tee", kModprobeConf});
         fileProc.write(newContent);
