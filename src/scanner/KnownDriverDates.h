@@ -2,13 +2,9 @@
 #include <QHash>
 #include <QString>
 
-// Release dates for unmaintained/legacy drivers whose upstream release date
-// cannot be determined from the local system. Each entry maps the exact version
-// string (as reported by `modinfo -F version`) to the ISO 8601 date on which
-// that version was officially published by the vendor.
-//
-// To add a new entry when a driver reaches end-of-life:
-//   {"<version>", "<YYYY-MM-DD>"},
+// Release dates for legacy drivers whose upstream date cannot be determined
+// from the local system. Maps the exact version string (as `modinfo -F version`
+// reports it) to the ISO 8601 date the vendor published it.
 //
 // Sources:
 //   NVIDIA legacy:  https://www.nvidia.com/en-us/drivers/unix/legacy-gpu/
@@ -19,7 +15,7 @@ inline const QHash<QString, QString> &knownDriverDates() {
         {"6.30.223.271", "2015-09-18"},
 
         // NVIDIA legacy branches (final release per branch)
-        {"470.256.02",   "2024-06-04"},  // 470.xx — last branch still maintained
+        {"470.256.02",   "2024-06-04"},  // 470.xx, last branch still maintained
         {"390.157",      "2022-11-22"},  // 390.xx
         {"340.108",      "2019-12-23"},  // 340.xx
         {"304.137",      "2017-09-19"},  // 304.xx

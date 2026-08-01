@@ -35,7 +35,7 @@ UdevMonitor::~UdevMonitor() {
 }
 
 void UdevMonitor::onSocketReady() {
-    // Drain every pending datagram before signalling — one deviceChanged()
+    // Drain every pending datagram before signalling, one deviceChanged()
     // per burst; the caller debounces further.
     char buf[4096];
     while (recv(m_sock, buf, sizeof(buf), MSG_DONTWAIT) > 0)

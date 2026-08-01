@@ -82,7 +82,7 @@ inline QIcon resolveIcon(const QString &name) {
         }
     }
 
-    // Absolute last resort — works on Adwaita (symbolic-only) and Breeze alike.
+    // Absolute last resort, works on Adwaita (symbolic-only) and Breeze alike.
     QIcon icon = QIcon::fromTheme(QStringLiteral("preferences-system"));
     if (!icon.isNull()) return icon;
     return QIcon::fromTheme(QStringLiteral("preferences-system-symbolic"));

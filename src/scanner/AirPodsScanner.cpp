@@ -14,6 +14,9 @@
 #include <QTimer>
 #include <QVariantMap>
 
+#include <algorithm>
+#include <tuple>
+
 using BluezInterfaces = QMap<QString, QVariantMap>;
 using BluezObjects    = QMap<QDBusObjectPath, BluezInterfaces>;
 using BluezVendorData = QMap<quint16, QDBusVariant>;
@@ -32,9 +35,9 @@ constexpr char kObjMgrIface[]  = "org.freedesktop.DBus.ObjectManager";
 
 constexpr quint16 kAppleCompanyId   = 0x004C;
 constexpr quint8  kProximityPairing = 0x07;
-// One type byte, one length byte, then 25 bytes of payload. Apple also sends
-// shorter 0x07 advertisements while a headset is in pairing mode; those use a
-// different layout and carry no battery levels.
+// One type byte, one length byte, then 25 bytes of payload. The shorter 0x07
+// advertisements Apple sends during pairing use a different layout and carry no
+// battery levels.
 constexpr int kAdvertLength = 27;
 
 // A2DP Audio Sink. Apple sells Bluetooth peripherals that are not headsets,
@@ -44,7 +47,10 @@ constexpr char kAudioSinkUuid[] = "0000110b-0000-1000-8000-00805f9b34fb";
 // Discovery competes with audio for the radio, so the budget is kept tight.
 // A headset that is awake is normally heard within a second.
 constexpr int kScanBudgetMs = 3000;
-constexpr int kSettleMs     = 400;   // keep listening briefly after a match
+// Kept listening after the first match. A headset advertises every 100-250ms,
+// so this is long enough to collect a handful of samples to average over.
+constexpr int kSettleMs   = 700;
+constexpr int kMaxSamples = 16;   // per device, past this the median will not move
 
 void registerBluezTypes() {
     static const bool done = [] {
@@ -70,9 +76,8 @@ bool decodeAdvert(const QByteArray &a, quint16 *model, AirPodsBattery *out) {
 
     *model = quint16(quint8(a.at(4)) << 8) | quint8(a.at(3));
 
-    // Either pod can be the primary of the pair, and the advertisement lists
-    // the primary first. This bit says which way round the pair currently is,
-    // so it decides which nibble belongs to which ear.
+    // Either pod can be the primary of the pair and the primary is listed
+    // first, so this bit decides which nibble belongs to which ear.
     const bool flipped = ((quint8(a.at(5)) >> 4) & 0x02) == 0;
 
     const quint8 primary   = quint8(a.at(6)) >> 4;
@@ -86,6 +91,47 @@ bool decodeAdvert(const QByteArray &a, quint16 *model, AirPodsBattery *out) {
     out->rightCharging = charging & (flipped ? 0x01 : 0x02);
     out->caseCharging  = charging & 0x04;
     return true;
+}
+
+// Folds several advertisements from one headset into a single reading. A
+// component's level is the median of the samples that reported it, so one odd
+// advertisement cannot skew the result the way a lone sample would. Charging is
+// a majority vote over those samples. A component none reported stays at -1.
+AirPodsBattery mergeAdverts(const QVector<QByteArray> &adverts) {
+    static constexpr struct {
+        int  AirPodsBattery::*level;
+        bool AirPodsBattery::*charging;
+    } kComponents[] = {
+        {&AirPodsBattery::left,      &AirPodsBattery::leftCharging},
+        {&AirPodsBattery::right,     &AirPodsBattery::rightCharging},
+        {&AirPodsBattery::caseLevel, &AirPodsBattery::caseCharging},
+    };
+
+    QVector<AirPodsBattery> samples;
+    for (const QByteArray &advert : adverts) {
+        quint16 model = 0;
+        AirPodsBattery one;
+        if (decodeAdvert(advert, &model, &one))
+            samples.append(one);
+    }
+
+    AirPodsBattery out;
+    for (const auto &component : kComponents) {
+        QVector<int> levels;
+        int chargingVotes = 0;
+        for (const AirPodsBattery &sample : samples) {
+            if (sample.*(component.level) < 0)
+                continue;
+            levels.append(sample.*(component.level));
+            chargingVotes += sample.*(component.charging) ? 1 : -1;
+        }
+        if (levels.isEmpty())
+            continue;
+        std::sort(levels.begin(), levels.end());
+        out.*(component.level)    = levels.at(levels.size() / 2);
+        out.*(component.charging) = chargingVotes > 0;
+    }
+    return out;
 }
 
 bool managedObjects(const QDBusConnection &bus, BluezObjects *out) {
@@ -111,8 +157,7 @@ QString poweredAdapter(const BluezObjects &objects) {
 
 // Connected Apple headsets, identified by the vendor and product in their
 // Device ID record. The product id also appears in the advertisement, which is
-// how a captured advertisement is tied back to a device that is really ours
-// rather than to a neighbour's headset.
+// how a capture is tied back to our device rather than a neighbour's headset.
 QVector<AirPodsDevice> appleAudioFrom(const BluezObjects &objects) {
     static const QRegularExpression modaliasRe(
         QStringLiteral("^bluetooth:v004Cp([0-9A-Fa-f]{4})d"),
@@ -151,6 +196,10 @@ QVector<AirPodsDevice> appleAudioFrom(const BluezObjects &objects) {
     return out;
 }
 
+// RSSI swings by several dB between readings, so it is compared in buckets this
+// wide. A lead smaller than one bucket is noise, not a closer device.
+constexpr int kRssiBucketDb = 8;
+
 int rssiFor(const BluezObjects &objects, const QString &path) {
     const auto obj = objects.constFind(QDBusObjectPath(path));
     if (obj == objects.constEnd())
@@ -163,18 +212,15 @@ int rssiFor(const BluezObjects &objects, const QString &path) {
 
 } // namespace
 
-// Collects matching advertisements as BlueZ reports them.
-//
-// The advertisements have to be taken from the signals themselves rather than
-// polled off the device objects: BlueZ keeps only the most recent vendor data
-// per company id, and Apple headsets interleave several advertisement types, so
-// by the time a poll runs the battery advertisement has usually been overwritten
-// by an unrelated one.
+// Collects matching advertisements as BlueZ reports them. They have to come
+// from the signals rather than a poll of the device objects: BlueZ keeps only
+// the newest vendor data per company id, and Apple headsets interleave several
+// advertisement types, so a poll usually finds the battery one overwritten.
 class AirPodsAdvertCollector : public QObject {
     Q_OBJECT
 public:
     quint16 wantedModel = 0;
-    QHash<QString, QByteArray> hits;   // object path -> advertisement
+    QHash<QString, QVector<QByteArray>> hits;   // object path -> advertisements
     QEventLoop loop;
 
     AirPodsAdvertCollector() {
@@ -216,9 +262,13 @@ private:
         if (!decodeAdvert(advert, &model, &probe) || model != wantedModel)
             return;
 
-        hits.insert(path, advert);
-        // Give any other headset of the same model a moment to be heard too, so
-        // the closest one can be picked rather than simply the first heard.
+        QVector<QByteArray> &samples = hits[path];
+        if (samples.size() < kMaxSamples)
+            samples.append(advert);
+
+        // Keep listening a moment longer, both to average this headset over
+        // several advertisements and to let another of the same model be heard,
+        // so the closest can be picked rather than the first.
         if (!m_settle.isActive())
             m_settle.start(kSettleMs);
     }
@@ -231,8 +281,8 @@ QVector<AirPodsDevice> connectedAirPods() {
 
     QVector<AirPodsDevice> result;
     const QString connName = QStringLiteral("devmgmt-airpods-list");
-    // Scoped so the connection is released before it is torn down; the socket
-    // stays open for as long as any handle to it survives.
+    // Scoped so the handle is gone before the bus is torn down; the socket stays
+    // open for as long as any handle to it survives.
     {
         QDBusConnection bus =
             QDBusConnection::connectToBus(QDBusConnection::SystemBus, connName);
@@ -292,26 +342,29 @@ AirPodsBattery captureBattery(QDBusConnection &bus, const QString &address) {
 
     adapter.call(QStringLiteral("StopDiscovery"));
 
-    // Signal strength is read afterwards; the advertisements themselves do not
-    // carry it. Headsets rotate their advertising address, so several entries
-    // can be the same physical pair — picking the strongest is what keeps a
-    // neighbour's identical model from winning when both are in range.
+    // Signal strength is read afterwards, the advertisements do not carry it.
+    // Headsets rotate their advertising address, so several entries can be the
+    // same physical pair; picking the strongest keeps a neighbour's identical
+    // model from winning when both are in range.
     BluezObjects seen;
     managedObjects(bus, &seen);
 
-    QByteArray best;
-    int bestRssi = 0;
+    // Within one RSSI bucket the tie goes to whichever was heard more often: a
+    // better proximity signal than a single noisy reading, and far steadier
+    // from run to run. The path breaks the remaining tie only so the choice
+    // does not follow QHash's ordering.
+    const QVector<QByteArray> *best = nullptr;
+    std::tuple<int, int, QString> bestRank;
     for (auto hit = collector.hits.constBegin(); hit != collector.hits.constEnd(); ++hit) {
-        const int rssi = rssiFor(seen, hit.key());
-        if (best.isEmpty() || rssi > bestRssi) {
-            best     = hit.value();
-            bestRssi = rssi;
+        auto rank = std::make_tuple(rssiFor(seen, hit.key()) / kRssiBucketDb,
+                                    int(hit.value().size()), hit.key());
+        if (!best || rank > bestRank) {
+            best     = &hit.value();
+            bestRank = std::move(rank);
         }
     }
-    if (!best.isEmpty()) {
-        quint16 seenModel = 0;
-        decodeAdvert(best, &seenModel, &result);
-    }
+    if (best)
+        result = mergeAdverts(*best);
     return result;
 }
 
@@ -322,9 +375,7 @@ AirPodsBattery requestAirPodsBattery(const QString &address) {
 
     AirPodsBattery result;
     const QString connName = QStringLiteral("devmgmt-airpods-scan");
-    // Scoped so the connection is released before it is torn down; the socket
-    // stays open for as long as any handle to it survives.
-    {
+    {   // scoped as in connectedAirPods()
         QDBusConnection bus =
             QDBusConnection::connectToBus(QDBusConnection::SystemBus, connName);
         result = captureBattery(bus, address);

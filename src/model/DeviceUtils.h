@@ -30,27 +30,26 @@ inline bool isValidModuleName(const QString &name) {
 
 inline bool isSafeToDisable(const QString &driver) {
     static const QSet<QString> blocked{
-        // GPU drivers — disabling loses all display output
+        // GPU: no display output
         "amdgpu", "radeon", "nouveau", "i915", "xe",
         "nvidia", "nvidia_drm", "nvidia_modeset",
         "ast", "mgag200", "efifb", "vesafb", "simpledrm",
-        // Primary storage — disabling makes the system unbootable
+        // Primary storage: unbootable
         "nvme", "ahci", "sd_mod", "usb_storage", "libata",
         "virtio_blk", "mmc_block",
-        // USB host controllers — disabling kills USB keyboards/mice
-        // even though usbhid is also blocked
+        // USB host controllers: kills USB keyboards/mice, so blocked
+        // alongside usbhid rather than relying on it
         "xhci_hcd", "ehci_hcd", "ohci_hcd", "uhci_hcd",
-        // Input — disabling leaves the user with no keyboard or mouse
+        // Input: no keyboard or mouse
         "i8042", "atkbd", "psmouse", "usbhid", "hid_generic",
-        // Power management — disabling can cause thermal runaway or
-        // prevent the battery/AC subsystem from working
+        // Power management: thermal runaway, or a dead battery/AC subsystem
         "acpi", "acpi_cpufreq", "battery", "ac",
         "thermal", "processor", "intel_pstate",
-        // Device mapper / RAID — disabling breaks LVM and dm-crypt
+        // Device mapper / RAID: breaks LVM and dm-crypt
         "dm_mod", "md_mod",
         // Core networking (VM host)
         "virtio_net",
-        // Bluetooth stack core — disabling breaks all BT devices
+        // Bluetooth stack core: breaks all BT devices
         "bluetooth",
     };
     return !blocked.contains(driver);

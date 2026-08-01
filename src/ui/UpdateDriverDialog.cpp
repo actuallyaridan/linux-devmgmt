@@ -115,9 +115,8 @@ UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
             return;
         }
 
-        // Resolve to canonical path once so all subsequent checks and the
-        // privileged process all operate on the same concrete location,
-        // eliminating symlink-swap races between check and use.
+        // Resolve once so every later check and the privileged process operate
+        // on the same concrete location, ruling out symlink-swap races.
         QString canonPath = QDir(path).canonicalPath();
         if (canonPath.isEmpty()) {
             QMessageBox::warning(this, "No driver found",
@@ -138,8 +137,8 @@ UpdateDriverDialog::UpdateDriverDialog(const QString &deviceName,
                 QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
             return;
 
-        // Re-verify with the resolved path immediately before handing it to
-        // a privileged process — closes the remaining TOCTOU window.
+        // Re-verify immediately before handing the path to a privileged
+        // process, closing the remaining TOCTOU window.
         if (!QFileInfo::exists(canonPath + "/dkms.conf")) {
             QMessageBox::warning(this, "No driver found",
                 "The selected directory no longer contains a dkms.conf file.");

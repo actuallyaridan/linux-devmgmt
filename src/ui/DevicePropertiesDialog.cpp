@@ -34,10 +34,28 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QTextStream>
+#include <QHash>
+#include <QTime>
 
 namespace {
 
 QProcess *s_usbmuxdProc = nullptr;
+
+// The last battery reading taken for each headset, keyed by Bluetooth address.
+// Capturing a level needs a radio scan that competes with audio, so it only
+// happens on request and a normal device scan cannot recover it. Kept here
+// across the dialog closing and reopening rather than being read again.
+struct AirPodsReading {
+    AirPodsBattery battery;
+    QTime          taken;
+};
+
+QHash<QString, AirPodsReading> s_airpodsReadings;
+
+const AirPodsReading *lastAirPodsReading(const QString &address) {
+    const auto it = s_airpodsReadings.constFind(address.toLower());
+    return it == s_airpodsReadings.constEnd() ? nullptr : &it.value();
+}
 
 bool isUsbmuxdRunning() {
     QProcess p;
@@ -81,9 +99,9 @@ void launchUsbmuxd() {
                 // Disconnect first to prevent the finished lambda from running a
                 // deleteLater() on a pointer we are about to delete synchronously.
                 proc->disconnect();
-                // usbmuxd -x sends an exit request through the socket.
-                // The socket is world-writable so this works without root,
-                // unlike sending SIGTERM directly to a root-owned process.
+                // usbmuxd -x sends an exit request through the socket, which is
+                // world-writable, so this works without root, unlike sending
+                // SIGTERM directly to a root-owned process.
                 QProcess::execute("usbmuxd", {"-x"});
                 proc->waitForFinished(3000);
                 delete proc;
@@ -92,27 +110,28 @@ void launchUsbmuxd() {
     }
 }
 
-QString describeAirPodsBattery(const AirPodsBattery &b) {
+QString describeAirPodsBattery(const AirPodsReading &r) {
+    // Every component is listed every time so the reading keeps its shape
+    // whatever is in the case; one that is not broadcasting reads as
+    // unavailable rather than dropping out.
     auto line = [](const char *label, int level, bool charging) {
+        QString s = QString(label) + ": ";
         if (level < 0)
-            return QString();
-        QString s = QString(label) + ": " + QString::number(level) + "%";
+            return s + "Unavailable\n";
+        s += QString::number(level) + "%";
         if (charging)
             s += " (charging)";
         return s + "\n";
     };
 
-    QString out = line("Left", b.left, b.leftCharging)
-                + line("Right", b.right, b.rightCharging)
-                + line("Case", b.caseLevel, b.caseCharging);
+    const AirPodsBattery &b = r.battery;
+    QString out = "Battery levels, read at " + r.taken.toString("HH:mm") + ":\n";
+    out += line("Left", b.left, b.leftCharging)
+         + line("Right", b.right, b.rightCharging)
+         + line("Case", b.caseLevel, b.caseCharging);
 
-    if (b.left < 0 || b.right < 0 || b.caseLevel < 0)
-        out += "\nAnything not listed is not reporting: a pod stops while it "
-               "sits in the case, and the case stops while its lid is shut.\n";
-
-    // The broadcast carries one value per component in steps of ten, so a pod
-    // Apple's own software shows as 83% is broadcast as 80%.
-    out += "\nLevels are broadcast in steps of ten, so they are approximate.";
+    out += "\nLevels are broadcast in steps of ten, so they are approximate. "
+           "They are not updated on their own.";
     return out;
 }
 
@@ -257,11 +276,17 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
     else if (m_info.status == "No driver loaded")
         statusText = "The drivers for this device are not installed. "
                      "(Code 28)";
-    else if (m_info.airpodsBattery && m_info.status == "No battery level")
-        statusText = "This device is working properly.\n\n"
-                     "This device broadcasts its battery level rather than "
-                     "reporting it over the connection, so the level has to be "
-                     "requested.";
+    else if (m_info.airpodsBattery && m_info.status == "No battery level") {
+        // A reading taken earlier in this session is shown again here, since the
+        // scan that produced it is too costly to repeat on every open.
+        const AirPodsReading *reading = lastAirPodsReading(m_info.btAddress);
+        statusText = "This device is working properly.\n\n";
+        statusText += reading
+            ? describeAirPodsBattery(*reading)
+            : QStringLiteral("This device broadcasts its battery level rather "
+                             "than reporting it over the connection, so the "
+                             "level has to be requested.");
+    }
     else if (m_info.status == "No battery level")
         statusText = "This device is working properly.\n\nNo reported battery level.";
     else if (m_info.status.startsWith("Battery level: "))
@@ -398,21 +423,31 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
         sectionLayout->setContentsMargins(0, 4, 0, 0);
         sectionLayout->setSpacing(6);
 
-        auto *infoLabel = new QLabel(
-            "Reading the level needs a brief Bluetooth scan, which shares the "
-            "radio with audio. Playback may stutter or drop out while it runs, "
-            "and is more likely to on older adapters.");
-        infoLabel->setWordWrap(true);
-        sectionLayout->addWidget(infoLabel);
+        const bool haveReading = lastAirPodsReading(m_info.btAddress) != nullptr;
 
-        auto *readBtn = new QPushButton("Request battery level");
+        // The warning about the radio scan is worth making only once. Anyone
+        // updating a level they can already see has been through it before.
+        if (!haveReading) {
+            auto *infoLabel = new QLabel(
+                "Reading the level needs a brief Bluetooth scan, which shares the "
+                "radio with audio. Playback may stutter or drop out while it runs, "
+                "and is more likely to on older adapters.");
+            infoLabel->setWordWrap(true);
+            sectionLayout->addWidget(infoLabel);
+        }
+
+        const QString readLabel = haveReading ? QStringLiteral("Update battery level")
+                                              : QStringLiteral("Request battery level");
+
+        auto *readBtn = new QPushButton(readLabel);
         sectionLayout->addWidget(readBtn, 0, Qt::AlignLeft);
 
         gbLayout->addWidget(podsSection);
 
-        connect(readBtn, &QPushButton::clicked, this, [this, statusBox, readBtn] {
+        connect(readBtn, &QPushButton::clicked, this,
+                [this, statusBox, readBtn, readLabel] {
             readBtn->setEnabled(false);
-            readBtn->setText("Listening...");
+            readBtn->setText("Reading...");
             // Repaint the button before the scan takes over the radio, so the
             // window does not sit there looking unresponsive.
             QCoreApplication::processEvents();
@@ -420,18 +455,26 @@ QWidget *DevicePropertiesDialog::buildGeneralTab() {
             const AirPodsBattery battery = requestAirPodsBattery(m_info.btAddress);
 
             readBtn->setEnabled(true);
-            readBtn->setText("Request battery level");
+            readBtn->setText(readLabel);
 
             if (battery.isEmpty()) {
+                // Nothing heard is not worth a reopen; the dialog would only
+                // come back in the state it is already in.
                 statusBox->setPlainText(
                     "This device is working properly.\n\n"
-                    "No battery level was heard. A headset sitting in a closed "
-                    "case stops broadcasting — take it out, or open the lid, "
+                    "No battery level was reported. "
+                    "Make sure the AirPods are out of the case, "
                     "and try again.");
                 return;
             }
-            statusBox->setPlainText("This device is working properly.\n\n"
-                                    + describeAirPodsBattery(battery));
+
+            s_airpodsReadings.insert(m_info.btAddress.toLower(),
+                                     {battery, QTime::currentTime()});
+            // Reopened rather than patched in place, so the status text and
+            // button label are rebuilt together from the stored reading, as the
+            // usbmuxd button above does for an iPhone.
+            emit refreshRequested();
+            accept();
         });
     } else {
         gbLayout->setContentsMargins(8, 3, 8, 32);

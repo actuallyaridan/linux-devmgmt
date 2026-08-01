@@ -35,10 +35,9 @@ bool setModuleBlacklisted(const QString &driver, bool blacklist, QWidget *parent
         fileProc.write(QString("blacklist %1\n").arg(driver).toUtf8());
         fileProc.closeWriteChannel();
     } else {
-        // Read the file as the current user (modprobe.d files are 644),
-        // strip the matching line in memory, then overwrite via pkexec tee.
-        // Doing the filtering here avoids spawning sed and eliminates the
-        // non-atomic temp-file window that sed -i would produce.
+        // Read as the current user (modprobe.d files are 644), strip the
+        // matching line in memory, then overwrite via pkexec tee. Filtering
+        // here avoids sed and its non-atomic temp-file window.
         const QString target = QString("blacklist %1").arg(driver);
         QByteArray newContent;
         QFile confFile(kModprobeConf);
@@ -66,7 +65,7 @@ bool setModuleBlacklisted(const QString &driver, bool blacklist, QWidget *parent
         return false;
     }
 
-    // Non-fatal for enable (the module may simply not be installed), but reported for disable.
+    // Non-fatal for enable (the module may not be installed), reported for disable.
     QProcess modProc;
     if (blacklist)
         modProc.start("pkexec", {"modprobe", "-r", driver});
@@ -104,9 +103,9 @@ bool dkmsRemove(const QString &driver, QWidget *parent) {
     }
     QString dkmsStatus = QString::fromUtf8(proc.readAllStandardOutput());
 
-    // Match on the module name at the start of each line only.
-    // dkms status formats: "name/version, ..." (new) or "name, version, ..." (old).
-    // Using contains() would match "foo" inside "foobar", removing the wrong module.
+    // Match the module name at the start of the line only: contains() would
+    // match "foo" inside "foobar" and remove the wrong module. dkms status
+    // prints "name/version, ..." (new) or "name, version, ..." (old).
     QString moduleLine;
     for (const QString &line : dkmsStatus.split('\n')) {
         if (line.startsWith(driver + "/") || line.startsWith(driver + ",")) {
@@ -125,9 +124,9 @@ bool dkmsRemove(const QString &driver, QWidget *parent) {
         return false;
     }
 
-    // Validate the parsed token before passing it to a privileged process.
-    // DKMS identifiers look like "name/version" or just "name"; permit only
-    // alphanumerics, underscores, hyphens, dots, and one optional slash.
+    // Validate before passing to a privileged process. DKMS identifiers look
+    // like "name/version" or just "name", so permit only alphanumerics,
+    // underscores, hyphens, dots, and slashes.
     static const QRegularExpression kDkmsRe("^[a-zA-Z0-9_./-]+$");
     if (!kDkmsRe.match(nameVer).hasMatch()) {
         QMessageBox::warning(parent, "Uninstall failed",

@@ -69,9 +69,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
 MainWindow::~MainWindow() {
     if (m_scanner && m_scanner->isRunning()) {
-        // Disconnect first so the finished signal doesn't trigger deleteLater
-        // or null out m_scanner while we're waiting — parent-child cleanup
-        // handles deletion after wait() returns.
+        // Disconnect first so the finished signal cannot deleteLater or null
+        // out m_scanner while we wait; parent-child cleanup handles deletion
+        // once wait() returns.
         m_scanner->disconnect();
         m_scanner->wait();
     }
@@ -309,7 +309,7 @@ void MainWindow::buildMenus() {
         auto *nameLabel = new QLabel("Device Manager");
 
         auto *companyLabel = new QLabel("@actuallyaridan");
-        auto *versionLabel = new QLabel("Version: 2.1");
+        auto *versionLabel = new QLabel("Version: 2.1.1");
 
         auto *infoLayout = new QVBoxLayout;
         infoLayout->addWidget(nameLabel);

@@ -394,7 +394,7 @@ QString usbVendorName(const QString &vendorHex) {
     return usbIds().vendors.value(key, key);
 }
 
-// Bluetooth SIG company identifiers — a separate registry from USB vendor IDs.
+// Bluetooth SIG company identifiers, a separate registry from USB vendor IDs.
 // Source: https://www.bluetooth.com/specifications/assigned-numbers/
 QString btCompanyName(const QString &hexId) {
     static const QHash<quint16, QString> kCompanies = {
@@ -689,10 +689,9 @@ QVector<Device> scanDisks() {
     return out;
 }
 
-// Returns true if this USB device entry is a Bluetooth adapter — detected by
-// interface class E0/01 (Wireless/Bluetooth) or by the btusb driver binding.
-// Such devices are shown under "Bluetooth Radios" and should be excluded from
-// the generic USB device and unknown-device lists to avoid duplicates.
+// Detected by interface class E0/01 (Wireless/Bluetooth) or by the btusb
+// driver binding. These are listed under "Bluetooth Radios", so the generic
+// USB and unknown-device lists exclude them to avoid duplicates.
 bool isBluetoothUsbDevice(const QString &entry) {
     QDir base("/sys/bus/usb/devices");
     const QString ifPrefix = entry + ":";
@@ -783,10 +782,8 @@ iOSBatteryInfo queryiOSBattery(const QString &udid) {
     return info;
 }
 
-// Returns a map keyed by UDID (with and without dashes) → battery info.
-// The sysfs /serial file contains the UDID without dashes; idevice_id -l may
-// return it with dashes (new-style UDIDs). Both forms are stored so the lookup
-// in scanPortableDevices() works regardless of which format sysfs exposes.
+// Keyed by UDID both with and without dashes: sysfs /serial omits them while
+// idevice_id -l may include them, so scanPortableDevices() matches either way.
 QHash<QString, iOSBatteryInfo> scaniOSBatteries() {
     QHash<QString, iOSBatteryInfo> result;
     QProcess idProc;
@@ -809,10 +806,9 @@ QHash<QString, iOSBatteryInfo> scaniOSBatteries() {
     return result;
 }
 
-// One battery-bearing device as UPower reports it. Enumerated once per scan and
-// shared by the two scanners that care: scanBatteries() uses it to fill in the
-// kernel-backed rows it already emits, and scanUPowerBatteries() lists whatever
-// is left over.
+// One battery-bearing device as UPower reports it. Enumerated once per scan:
+// scanBatteries() fills in the kernel-backed rows it already emits, and
+// scanUPowerBatteries() lists whatever is left over.
 struct UPowerDevice {
     QString objectPath;
     QString model;
@@ -887,12 +883,10 @@ QVector<UPowerDevice> scanUPowerDevices() {
     return out;
 }
 
-// Finds UPower's view of a device, if it has one. What lands in native-path
-// depends on which backend produced the device, so both forms are matched:
-//
-//   kernel power_supply  the bare node name, "ps-controller-battery-d4:2f:…"
-//   phone (libimobile.)  an absolute sysfs path, "/sys/devices/…/usb1/1-3"
-//   BlueZ                a D-Bus path, "/org/bluez/…" — never matches here
+// Finds UPower's view of a device, if it has one. Native-path takes a different
+// form per backend, so both are matched: a bare node name from kernel
+// power_supply ("ps-controller-battery-d4:2f:…") and an absolute sysfs path
+// from the phone backend. BlueZ paths ("/org/bluez/…") never match here.
 //
 // sysfsPath is the device that owns the battery; powerSupplyEntry is the
 // /sys/class/power_supply node name, empty for callers that have no such node.
@@ -920,7 +914,7 @@ const UPowerDevice *findUPowerDevice(const QVector<UPowerDevice> &devices,
 }
 
 bool isPortableUsbDevice(const QString &entry, const QString &canonPath) {
-    // Devices with a Still Image (MTP/PTP) interface — class 06
+    // Devices with a Still Image (MTP/PTP) interface, class 06
     QDir base("/sys/bus/usb/devices");
     QString prefix = entry + ":";
     for (const QString &e : base.entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
@@ -936,7 +930,7 @@ bool isPortableUsbDevice(const QString &entry, const QString &canonPath) {
             return true;
     }
     // Apple iOS devices connected before the user trusts the host show only
-    // vendor-specific interfaces — catch them by vendor + product name.
+    // vendor-specific interfaces, catch them by vendor + product name.
     if (readSysFile(canonPath + "/idVendor").trimmed().toLower() == "05ac") {
         QString product = readSysFile(canonPath + "/product").toLower();
         if (product.contains("iphone") || product.contains("ipad")
@@ -987,7 +981,7 @@ QVector<Device> scanPortableDevices(const QVector<UPowerDevice> &upower,
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
         d.location = friendlyLocation(path, entry);
-        // Keyed on the USB product, not the display name — a user-set name like
+        // Keyed on the USB product, not the display name, a user-set name like
         // "Adnan's brick" says nothing about which icon to draw.
         QString productLower = product.toLower();
         if (productLower.contains("ipad"))
@@ -1151,7 +1145,7 @@ QVector<Device> scanMice() {
         if (name.isEmpty())
             continue;
 
-        // Kernel reports relative-axis capability as a hex bitmap; bits 0–1 are REL_X/REL_Y.
+        // Relative-axis capability is a hex bitmap; bits 0-1 are REL_X/REL_Y.
         QString rel = readSysFile(path + "/capabilities/rel");
         if (rel.isEmpty())
             continue;
@@ -1200,7 +1194,7 @@ QVector<Device> scanKeyboards() {
         if (name.isEmpty())
             continue;
 
-        // Skip devices with REL_X+REL_Y capability — those are mice.
+        // Skip devices with REL_X+REL_Y capability, those are mice.
         QString rel = readSysFile(path + "/capabilities/rel");
         if (!rel.isEmpty()) {
             bool ok;
@@ -1232,7 +1226,6 @@ QVector<Device> scanKeyboards() {
             if (!keyWords.isEmpty()) {
                 bool ok;
                 quint64 lastWord = keyWords.last().toULongLong(&ok, 16);
-                // Mask covers bits 16-25 (KEY_Q through KEY_P).
                 if (!ok || (lastWord & 0x3FF0000ULL) == 0)
                     continue;
             }
@@ -1256,7 +1249,6 @@ QVector<Device> scanKeyboards() {
     return out;
 }
 
-// known HID drivers for game controllers
 const QSet<QString> kControllerDrivers = {
     "playstation", "sony", "nintendo", "xpad", "xpadneo",
 };
@@ -1281,7 +1273,7 @@ QVector<Device> scanHidGeneric() {
                 hidId = line.mid(7).trimmed();
         }
         // USB HID devices (bus 0003) are already shown under Universal Serial
-        // Bus devices — suppress the duplicate here, mirroring Win7's PnP tree.
+        // Bus devices, suppress the duplicate here, mirroring Win7's PnP tree.
         if (hidId.left(4).toUpper() == "0003")
             continue;
         if (hidName.isEmpty())
@@ -1304,9 +1296,9 @@ QVector<Device> scanHidGeneric() {
         d.driverDate = di.date;
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
-        // A Bluetooth HID interface belongs to the peripheral itself, which is
-        // the thing that connects to the machine — so name the parent here
-        // rather than repeating "connected via Bluetooth" at every level.
+        // A Bluetooth HID interface belongs to the peripheral, which is what
+        // actually connects to the machine, so name the parent here rather than
+        // repeating "connected via Bluetooth" at every level.
         d.location = hidId.left(4) == "0005" ? "on " + hidName
                                              : friendlyLocation(path, entry);
         out.append(d);
@@ -1323,7 +1315,7 @@ QVector<Device> scanBluetooth() {
     for (const QString &entry : base.entryList(
              QDir::AllEntries | QDir::NoDotAndDotDot)) {
         // Connection handles (e.g. "hci0:12") share the hci prefix but are
-        // per-device ACL links, not local adapters — skip them.
+        // per-device ACL links, not local adapters, skip them.
         if (!entry.startsWith("hci") || entry.contains(':'))
             continue;
 
@@ -1338,8 +1330,8 @@ QVector<Device> scanBluetooth() {
         int depth = 0;
 
         // USB root hubs (usb1, usb2, …) carry "xHCI Host Controller" etc. as
-        // their product string.  Walking past the real BT USB device into the
-        // root hub would misname the adapter, so we skip those directories.
+        // their product string, so walking past the real BT USB device into one
+        // would misname the adapter. Skip them.
         static const QRegularExpression kUsbRootHub(QStringLiteral(R"(^usb\d+$)"));
 
         while (deviceDir.cdUp() && ++depth <= 20) {
@@ -1353,7 +1345,7 @@ QVector<Device> scanBluetooth() {
             if (kUsbRootHub.match(QFileInfo(dirPath).fileName()).hasMatch())
                 continue;
 
-            // USB device with a product string — use it directly.
+            // USB device with a product string, use it directly.
             QString product = readSysFile(dirPath + "/product");
             if (!product.isEmpty()) {
                 name = product;
@@ -1362,7 +1354,7 @@ QVector<Device> scanBluetooth() {
                 break;
             }
 
-            // USB device without a product string — look up via USB ID database.
+            // USB device without a product string, look up via USB ID database.
             const QString idVendor = readSysFile(dirPath + "/idVendor").trimmed().toLower();
             if (!idVendor.isEmpty()) {
                 const QString idProduct = readSysFile(dirPath + "/idProduct").trimmed().toLower();
@@ -1378,7 +1370,7 @@ QVector<Device> scanBluetooth() {
                 break;
             }
 
-            // PCIe-native Bluetooth — look up via PCI ID database.
+            // PCIe-native Bluetooth, look up via PCI ID database.
             if (QFile::exists(dirPath + "/vendor") && QFile::exists(dirPath + "/class")) {
                 const QString pciVendor  = readHexId(dirPath + "/vendor");
                 const QString pciDevice  = readHexId(dirPath + "/device");
@@ -1398,9 +1390,9 @@ QVector<Device> scanBluetooth() {
                 break;
         }
 
-        // Driver modinfo description as fallback when the ID database yielded
-        // nothing specific.  Strips " driver" and any trailing version token so
-        // "Generic Bluetooth USB driver ver 0.8" becomes "Generic Bluetooth USB".
+        // Fallback when the ID database yielded nothing specific. Strips
+        // " driver" and any trailing version token, so "Generic Bluetooth USB
+        // driver ver 0.8" becomes "Generic Bluetooth USB".
         if ((name.isEmpty() || name == QStringLiteral("Bluetooth Adapter"))
                 && !actualDriver.isEmpty()) {
             QString desc = runCmd("modinfo", {"-F", "description", "--", actualDriver});
@@ -1500,8 +1492,6 @@ QVector<Device> scanOpticalDrives() {
 }
 
 
-// checks whether a power_supply battery at the given canonical path is
-// parented by a game controller HID driver
 bool isControllerBattery(const QString &canonicalPath) {
     QDir dir(canonicalPath);
     int depth = 0;
@@ -1664,7 +1654,7 @@ QVector<Device> scanBatteries(const QVector<UPowerDevice> &upower,
     if (!base.exists())
         return out;
     // ideviceinfo opens a lockdown session per device, so it is only run if
-    // UPower could not supply the level — see the apple_mfi branch below.
+    // UPower could not supply the level, see the apple_mfi branch below.
     std::optional<QHash<QString, iOSBatteryInfo>> iosBatteryCache;
     auto iosBatteries = [&]() -> const QHash<QString, iOSBatteryInfo> & {
         if (!iosBatteryCache)
@@ -1693,11 +1683,11 @@ QVector<Device> scanBatteries(const QVector<UPowerDevice> &upower,
         ownerDir.cdUp();
         const QString ownerPath = ownerDir.absolutePath();
 
-        // Every branch below emits exactly one row, so if UPower also knows this
-        // battery, claim it here — scanUPowerBatteries() must not list it again.
-        // The claim is made for all of them, not just the phone: any battery the
-        // kernel exposes with scope=Device is reported by UPower as "power
-        // supply: no" and so slips past the flag test over there.
+        // Every branch below emits exactly one row, so claim UPower's view of
+        // this battery to keep scanUPowerBatteries() from listing it again.
+        // Claimed for all of them, not just the phone: any battery the kernel
+        // exposes with scope=Device is reported by UPower as "power supply: no"
+        // and so slips past the flag test over there.
         const UPowerDevice *up = findUPowerDevice(upower, ownerPath, entry);
         if (up && consumedUPower)
             consumedUPower->insert(up->objectPath);
@@ -1719,13 +1709,12 @@ QVector<Device> scanBatteries(const QVector<UPowerDevice> &upower,
             if (usbProduct.isEmpty())
                 usbProduct = "Apple Device";
 
-            // This node only controls fast charging — it exposes no capacity of
-            // its own, so the level has to come from libimobiledevice either
-            // way. UPower reads it through the library and caches the result,
-            // while ideviceinfo spawns a fresh lockdown session per scan, so
-            // UPower goes first and the tools are the fallback. UPower also
-            // knows the user-set device name, which beats the generic USB
-            // product string ("Adnan – iPhone" rather than "iPhone").
+            // This node only controls fast charging and exposes no capacity, so
+            // the level comes from libimobiledevice either way. UPower reads it
+            // through the library and caches the result while ideviceinfo spawns
+            // a fresh lockdown session per scan, hence UPower first. UPower also
+            // knows the user-set name, which beats the generic USB product
+            // string ("Adnan's iPhone" rather than "iPhone").
             const QString displayName =
                 (up && !up->model.isEmpty()) ? up->model : usbProduct;
             d.name = "Battery on " + displayName;
@@ -1833,7 +1822,7 @@ QVector<Device> scanGameControllers() {
         QString name;
         QString mfr;
         QString driverName;
-        QString hidId;   // "BUS:VENDOR:PRODUCT" — BUS 0005=BT, 0003=USB
+        QString hidId;   // "BUS:VENDOR:PRODUCT", BUS 0005=BT, 0003=USB
         QString hidUniq; // unique address (BT MAC for Bluetooth devices)
         QDir dir(path);
         int depth = 0;
@@ -1877,9 +1866,8 @@ QVector<Device> scanGameControllers() {
 
         QString deviceStatus = "Working properly";
 
-        // Derive manufacturer from HID_ID vendor field (USB vendor ID registry).
-        // HID_ID format: "BUS:VENDOR:PRODUCT" — vendor field is 8 hex digits,
-        // last 4 match the USB/BT vendor IDs used in usb.ids.
+        // The HID_ID vendor field is 8 hex digits whose last 4 match the
+        // USB/BT vendor IDs in usb.ids.
         QString manufacturer = mfr;
         if (manufacturer.isEmpty() && !hidId.isEmpty()) {
             QStringList hidParts = hidId.split(':');
@@ -1904,7 +1892,6 @@ QVector<Device> scanGameControllers() {
         d.isDkms = di.isDkms;
         d.rawLocation = entry;
         d.btAddress = btAddr;
-        // HID_ID first field is the kernel bus type: 0005=BT, 0003=USB.
         // Fall back to sysfs path heuristics if HID_ID is unavailable.
         if (!hidId.isEmpty()) {
             QString busHex = hidId.left(4).toUpper();
@@ -2193,17 +2180,15 @@ QVector<Device> scanUnknownUsbDevices() {
 }
 
 // Bluetooth peripherals report charge via the BLE Battery Service (UUID 0x180F).
-// BlueZ surfaces that through UPower only — no /sys/class/power_supply entry is
-// created — so scanBatteries() never sees them. Query UPower for the rest.
+// BlueZ surfaces that through UPower only, with no /sys/class/power_supply
+// entry, so scanBatteries() never sees them. Query UPower for the rest.
 //
-// Devices UPower marks as "power supply: yes" are kernel-backed and already
-// covered by scanBatteries(); they are skipped here to avoid duplicates.
-//
-// That flag alone is not enough, though: it answers "does this power the host?",
-// not "is this kernel-backed". A phone answers no while apple-mfi-fastcharge
-// still gives it a power_supply node that scanBatteries() has already turned
-// into a row. Those are matched by native-path over there and arrive here in
-// consumed.
+// Devices UPower marks as "power supply: yes" are kernel-backed and skipped as
+// duplicates. That flag alone is not enough, though: it answers "does this power
+// the host?", not "is this kernel-backed". A phone answers no while
+// apple-mfi-fastcharge still gives it a power_supply node scanBatteries() has
+// already turned into a row; those are matched by native-path over there and
+// arrive here in consumed.
 QVector<Device> scanUPowerBatteries(const QVector<UPowerDevice> &upower,
                                     const QSet<QString> &consumed) {
     QVector<Device> out;
@@ -2232,7 +2217,7 @@ QVector<Device> scanUPowerBatteries(const QVector<UPowerDevice> &upower,
             d.isDkms        = di.isDkms;
             d.btAddress   = u.serial;
             d.rawLocation = u.serial.isEmpty() ? u.objectPath : u.serial;
-            // The battery lives in the peripheral, not on the Bluetooth link —
+            // The battery lives in the peripheral, not on the Bluetooth link,
             // it is the peripheral that is "connected via Bluetooth".
             d.location    = "on " + u.model;
         } else {
@@ -2245,12 +2230,11 @@ QVector<Device> scanUPowerBatteries(const QVector<UPowerDevice> &upower,
     return out;
 }
 
-// AirPods keep their battery levels out of every standard channel and put them
-// in a vendor advertisement instead, so reading them costs an LE scan that
-// shares the radio with audio playback (see AirPodsScanner.h). That is too
-// disruptive to do on every refresh, so the scan is left to the user: this
-// lists the headsets, and the properties dialog offers a button to read the
-// levels on demand.
+// AirPods broadcast their levels in a vendor advertisement rather than any
+// standard channel, so reading them costs an LE scan that competes with audio
+// playback (see AirPodsScanner.h). Too disruptive to do on every refresh, so
+// this only lists the headsets and the properties dialog offers a button to
+// read the levels on demand.
 QVector<Device> scanAirPodsPlaceholders() {
     QVector<Device> out;
     for (const AirPodsDevice &pods : connectedAirPods()) {
