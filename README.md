@@ -92,3 +92,4 @@ Why don't you also check out the other ones?
 
 - Linux Device Manager
 - [Linux Control Panel](https://github.com/actuallyaridan/linux-control)
+- [Linux Minesweeper](https://github.com/actuallyaridan/linux-minesweeper)
