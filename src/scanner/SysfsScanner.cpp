@@ -586,14 +586,18 @@ Device makePciDevice(const QString &sysfsPath) {
     return d;
 }
 
-QVector<Device> scanPciByClass(const QString &classPrefix) {
+QVector<Device> scanPciByClass(const QString &classPrefix,
+                               const QString &excludePrefix = {}) {
     QVector<Device> out;
     QDir base("/sys/bus/pci/devices");
     const QString lowerPrefix = classPrefix.toLower();
+    const QString lowerExclude = excludePrefix.toLower();
     for (const QString &entry : base.entryList(
              QDir::Dirs | QDir::NoDotAndDotDot)) {
         QString path = base.absoluteFilePath(entry);
         QString cls = readHexId(path + "/class");
+        if (!lowerExclude.isEmpty() && cls.startsWith(lowerExclude))
+            continue;
         if (cls.startsWith(lowerPrefix)) {
             Device d = makePciDevice(path);
             d.rawLocation = entry;
@@ -1994,7 +1998,7 @@ QVector<Device> scanPlatformDevices() {
 }
 
 QVector<Device> scanStorageControllers() {
-    return scanPciByClass("01");
+    return scanPciByClass("01", "0101");
 }
 
 QVector<Device> scanIdeControllers() {
