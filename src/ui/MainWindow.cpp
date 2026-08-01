@@ -410,9 +410,8 @@ void MainWindow::showContextMenu(const QPoint &pos) {
 
     QMenu menu(this);
 
-    menu.addAction("Update driver software...", [this, idx] {
-        QString n = m_model->deviceField(idx, "name").toString();
-        UpdateDriverDialog dlg(n, this);
+    menu.addAction("Update driver software...", [this, name] {
+        UpdateDriverDialog dlg(name, this);
         dlg.exec();
     });
 
