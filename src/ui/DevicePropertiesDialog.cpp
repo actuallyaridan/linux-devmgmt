@@ -773,10 +773,11 @@ QWidget *DevicePropertiesDialog::buildResourcesTab() {
     const QIcon ioIcon  = makeIcon(QColor(40, 140, 40));
     const QIcon irqIcon = makeIcon(QColor(210, 160, 20));
 
-    auto resourceType = [](quint64 flags) -> QString {
-        if (flags == 0) return {};
-        if (flags & 0x200) return "I/O Range";
-        return "Memory Range";
+    auto isIoRange = [](quint64 flags) { return (flags & 0x100) != 0; };
+    auto resourceType = [&isIoRange](quint64 flags) -> QString {
+        if (isIoRange(flags)) return "I/O Range";
+        if (flags & 0x200) return "Memory Range";
+        return {};
     };
 
     if (!m_info.sysfsPciPath.isEmpty()) {
@@ -807,7 +808,7 @@ QWidget *DevicePropertiesDialog::buildResourcesTab() {
                         QString type = resourceType(flags);
                         if (!type.isEmpty()) {
                             auto *item = new QTreeWidgetItem(tree);
-                            bool isIO = (flags & 0x200);
+                            bool isIO = isIoRange(flags);
                             item->setIcon(0, isIO ? ioIcon : memIcon);
                             item->setText(0, type);
                             item->setText(1, fmtAddr(start) + " - " + fmtAddr(end));
