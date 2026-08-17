@@ -371,6 +371,7 @@ void MainWindow::buildMenus() {
 
 void MainWindow::buildToolbar() {
     auto *tb = addToolBar("Main");
+    tb->setProperty("_Aero_flat", "true");
     tb->setMovable(false);
     tb->setFloatable(false);
     tb->setIconSize(QSize(16, 16));
